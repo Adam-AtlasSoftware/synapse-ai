@@ -1,0 +1,52 @@
+{
+  "name": "XOR",
+  "description": "The classic. Two binary inputs, one output = A XOR B. The simplest thing a network can only solve with a hidden layer.",
+  "input_dim": 2,
+  "layers": [
+    {
+      "type": "dense",
+      "units": 4,
+      "activation": "tanh"
+    },
+    {
+      "type": "dense",
+      "units": 1,
+      "activation": "sigmoid"
+    }
+  ],
+  "io": {
+    "input": {
+      "layout": "labels",
+      "labels": [
+        "A",
+        "B"
+      ],
+      "range": [0, 1]
+    },
+    "output": {
+      "layout": "labels",
+      "labels": [
+        "A XOR B"
+      ],
+      "kind": "value"
+    }
+  },
+  "dataset": [
+    {
+      "input": [0, 0],
+      "target": [0]
+    },
+    {
+      "input": [0, 1],
+      "target": [1]
+    },
+    {
+      "input": [1, 0],
+      "target": [1]
+    },
+    {
+      "input": [1, 1],
+      "target": [0]
+    }
+  ]
+}

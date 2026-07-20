@@ -1,0 +1,90 @@
+{
+  "name": "Seven-segment digit",
+  "description": "Seven segment toggles (a–g, like a calculator display) → which digit 0-9 is lit. Digit recognition with labeled inputs, no grid yet.",
+  "input_dim": 7,
+  "layers": [
+    {
+      "type": "dense",
+      "units": 12,
+      "activation": "relu"
+    },
+    {
+      "type": "dense",
+      "units": 10,
+      "activation": "softmax"
+    }
+  ],
+  "io": {
+    "input": {
+      "layout": "labels",
+      "labels": [
+        "a",
+        "b",
+        "c",
+        "d",
+        "e",
+        "f",
+        "g"
+      ],
+      "range": [0, 1]
+    },
+    "output": {
+      "layout": "labels",
+      "labels": [
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9"
+      ],
+      "kind": "class"
+    }
+  },
+  "dataset": [
+    {
+      "input": [1, 1, 1, 1, 1, 1, 0],
+      "target": [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    },
+    {
+      "input": [0, 1, 1, 0, 0, 0, 0],
+      "target": [0, 1, 0, 0, 0, 0, 0, 0, 0, 0]
+    },
+    {
+      "input": [1, 1, 0, 1, 1, 0, 1],
+      "target": [0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+    },
+    {
+      "input": [1, 1, 1, 1, 0, 0, 1],
+      "target": [0, 0, 0, 1, 0, 0, 0, 0, 0, 0]
+    },
+    {
+      "input": [0, 1, 1, 0, 0, 1, 1],
+      "target": [0, 0, 0, 0, 1, 0, 0, 0, 0, 0]
+    },
+    {
+      "input": [1, 0, 1, 1, 0, 1, 1],
+      "target": [0, 0, 0, 0, 0, 1, 0, 0, 0, 0]
+    },
+    {
+      "input": [1, 0, 1, 1, 1, 1, 1],
+      "target": [0, 0, 0, 0, 0, 0, 1, 0, 0, 0]
+    },
+    {
+      "input": [1, 1, 1, 0, 0, 0, 0],
+      "target": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0]
+    },
+    {
+      "input": [1, 1, 1, 1, 1, 1, 1],
+      "target": [0, 0, 0, 0, 0, 0, 0, 0, 1, 0]
+    },
+    {
+      "input": [1, 1, 1, 1, 0, 1, 1],
+      "target": [0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+    }
+  ]
+}
