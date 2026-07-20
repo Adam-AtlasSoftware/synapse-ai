@@ -7,8 +7,11 @@
 // backend when none is available.
 namespace synapse::detail {
 
+// In-order so a chain of dependent kernels (e.g. a batched training epoch) executes
+// in submission order without an explicit host-device sync between each one — that
+// per-kernel synchronization was the bottleneck for batched GPU training.
 inline sycl::queue& queue() {
-  static sycl::queue q{sycl::default_selector_v};
+  static sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order()};
   return q;
 }
 

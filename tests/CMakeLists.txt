@@ -10,3 +10,5 @@ target_link_libraries(train_smoke PRIVATE synapse_engine)
 # XOR exercises sigmoid + MSE; seven-segment exercises softmax + cross-entropy.
 add_test(NAME train_xor COMMAND train_smoke ${CMAKE_SOURCE_DIR}/models/blueprints/xor.json 0.3 5000)
 add_test(NAME train_classifier COMMAND train_smoke ${CMAKE_SOURCE_DIR}/models/blueprints/seven_segment.json 0.1 5000)
+# Full-batch GPU training path (batched matrix ops).
+add_test(NAME train_gpu_batched COMMAND train_smoke ${CMAKE_SOURCE_DIR}/models/blueprints/seven_segment.json 0.5 8000 gpu)

@@ -74,8 +74,11 @@ ApplicationWindow {
 
     Component.onCompleted: {
         root.initEdit()
-        // Dev/demo hook: SYNAPSE_GRAB=<path> renders this window to a PNG and quits.
-        if (typeof grabPath !== 'undefined' && grabPath && grabPath.length > 0) {
+        // Dev/demo hook: with SYNAPSE_DATAMANAGER + SYNAPSE_GRAB=<path>, render this
+        // window to a PNG and quit. Gated on the data-manager flag so SYNAPSE_GRAB on
+        // its own captures the main window instead of being hijacked here.
+        if (typeof grabPath !== 'undefined' && grabPath && grabPath.length > 0
+                && typeof autoOpenDataManager !== 'undefined' && autoOpenDataManager) {
             root.visible = true
             grabTimer.start()
         }

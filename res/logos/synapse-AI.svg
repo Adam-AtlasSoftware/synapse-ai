@@ -1,0 +1,23 @@
+<svg width="100%" viewBox="0 0 680 480" role="img" xmlns="http://www.w3.org/2000/svg" style=""><title style="fill:rgb(0, 0, 0);stroke:none;color:rgb(11, 11, 11);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">Synapse AI app icon, version 16</title><desc style="fill:rgb(0, 0, 0);stroke:none;color:rgb(11, 11, 11);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">A dark, modern app icon: a single continuous ring that starts as a thin dark blue line at the upper right and grows steadily thicker as it sweeps clockwise around the circle, turning dark amber in its final stretch and ending in a rounded terminal beside a four-point gold spark that sits in the ring's gap, on a very dark navy gradient rounded square.</desc>
+<defs>
+<linearGradient id="bgGrad16" x1="0" y1="0" x2="1" y2="1">
+<stop offset="0" stop-color="#060a12"/>
+<stop offset="1" stop-color="#101c30"/>
+</linearGradient>
+<linearGradient id="blueGrad16" x1="1" y1="1" x2="0" y2="0">
+<stop offset="0" stop-color="#26496e"/>
+<stop offset="1" stop-color="#4076b2"/>
+</linearGradient>
+<clipPath id="iconClip16"><rect x="140" y="40" width="400" height="400" rx="88"/></clipPath>
+</defs>
+
+<g clip-path="url(#iconClip16)" style="fill:rgb(0, 0, 0);stroke:none;color:rgb(11, 11, 11);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
+<rect x="140" y="40" width="400" height="400" fill="url(#bgGrad16)" style="stroke:none;color:rgb(11, 11, 11);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+<path d="M417.0 215.0&#10;A81.8 81.8 0 0 1 409.2 285.0&#10;A83.3 83.3 0 0 1 348.8 323.6&#10;A84.8 84.8 0 0 1 279.6 300.5&#10;A86.3 86.3 0 0 1 253.4 230.9&#10;A87.8 87.8 0 0 1 291.8 165.7&#10;L303.2 183.4&#10;A68.3 68.3 0 0 0 271.3 232.8&#10;A69.8 69.8 0 0 0 290.2 289.8&#10;A71.3 71.3 0 0 0 347.6 311.6&#10;A72.8 72.8 0 0 0 401.7 280.1&#10;A74.3 74.3 0 0 0 411.3 216.8&#10;A3 3 0 0 0 417.0 215.0&#10;Z" fill="url(#blueGrad16)" style="stroke:none;color:rgb(11, 11, 11);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+<path d="M291.8 165.7&#10;A89.3 89.3 0 0 1 367.8 154.4&#10;A12 12 0 0 1 360.4 177.2&#10;A66.8 66.8 0 0 0 303.2 183.4&#10;Z" fill="#c07e2e" style="fill:rgb(192, 126, 46);stroke:none;color:rgb(11, 11, 11);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+<path d="M398 165 C401 181 407 185 420 187 C407 189 401 193 398 209 C395 193 389 189 376 187 C389 185 395 181 398 165 Z" fill="#e6b64a" style="fill:rgb(230, 182, 74);stroke:none;color:rgb(11, 11, 11);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+</g>
+</svg>

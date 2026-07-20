@@ -82,11 +82,11 @@ void EngineBridge::rebuild() {
   m_epoch = 0;
   m_currentLoss = 0.0;
   m_lossHistory.clear();
+  m_flatDirty = true;   // output_dim / dataset shape may have changed
   emit trainingProgress();
   try {
     m_net.build(m_topo, m_seed);  // re-initializes weights
-    m_net.set_observer(this);     // fires on_topology -> refreshes columns/layers
-    m_modelName = QString::fromStdString(m_topo.name);
+    m_net.set_observer(this);     // fires on_topology -> refreshes name/columns/layers
     runForwardZeros();            // populate activations + weights so nothing is blank
   } catch (const std::exception& e) {
     emit errorOccurred(QString::fromUtf8(e.what()));
@@ -97,6 +97,7 @@ void EngineBridge::rebuild() {
 
 void EngineBridge::on_topology(const Topology& topo) {
   m_topo = topo;
+  m_modelName = QString::fromStdString(topo.name);  // set BEFORE topologyChanged fires
 
   QVariantList cols;
   QVariantMap input;
@@ -140,7 +141,7 @@ void EngineBridge::on_step(const StepSnapshot& snap) {
     acts.push_back(QVariantList{});
     dts.push_back(QVariantList{});
   }
-  QVariantList wts, grs;
+  QVariantList wts, grs, bs;
 
   if (auto it = byName.find("input"); it != byName.end())
     acts[0] = toVariantList(it->second->data);
@@ -170,6 +171,11 @@ void EngineBridge::on_step(const StepSnapshot& snap) {
       g["values"] = toVariantList(tv->data);
     }
     grs.push_back(g);
+
+    QVariantList bvec;
+    if (auto it = byName.find("biases." + name); it != byName.end())
+      bvec = toVariantList(it->second->data);
+    bs.push_back(bvec);
   }
 
   // Predicted class = argmax over the output column's activations.
@@ -190,6 +196,7 @@ void EngineBridge::on_step(const StepSnapshot& snap) {
   m_weights = wts;
   m_deltas = dts;
   m_grads = grs;
+  m_biases = bs;
   m_activeLayer = snap.active_layer;
   m_phase = QString::fromStdString(snap.phase);
   emit activationsChanged();
@@ -315,6 +322,7 @@ void EngineBridge::addExample(const QVariantList& in, int labelIndex) {
   s.target.assign(outDim, 0.0f);
   s.target[labelIndex] = 1.0f;
   m_dataset.samples.push_back(std::move(s));
+  m_flatDirty = true;
   emit datasetChanged();
   emit trainingProgress();  // hasDataset / dataset size shown in the UI
 }
@@ -333,6 +341,7 @@ void EngineBridge::addExampleRaw(const QVariantList& in, const QVariantList& tar
   s.target = toVector(target);
   s.target.resize(m_topo.output_dim(), 0.0f);
   m_dataset.samples.push_back(std::move(s));
+  m_flatDirty = true;
   emit datasetChanged();
   emit trainingProgress();
 }
@@ -344,12 +353,14 @@ void EngineBridge::updateExample(int i, const QVariantList& in, const QVariantLi
   s.input.resize(m_topo.input_dim, 0.0f);
   s.target = toVector(target);
   s.target.resize(m_topo.output_dim(), 0.0f);
+  m_flatDirty = true;
   emit datasetChanged();
 }
 
 void EngineBridge::removeExample(int i) {
   if (i < 0 || i >= m_dataset.size()) return;
   m_dataset.samples.erase(m_dataset.samples.begin() + i);
+  m_flatDirty = true;
   emit datasetChanged();
   emit trainingProgress();
 }
@@ -660,6 +671,39 @@ float EngineBridge::run_one_epoch() {
   return sum / static_cast<float>(n);
 }
 
+void EngineBridge::setGpuTraining(bool on) {
+  if (m_gpuTraining == on) return;
+  m_gpuTraining = on;
+  emit gpuTrainingChanged();
+}
+
+// Flatten the dataset into contiguous input/target arrays for the batched GPU path.
+void EngineBridge::ensureFlatDataset() {
+  if (!m_flatDirty) return;
+  const int inDim = m_topo.input_dim, outDim = m_topo.output_dim();
+  m_flatIn.clear();
+  m_flatOut.clear();
+  m_flatIn.reserve(static_cast<size_t>(m_dataset.size()) * inDim);
+  m_flatOut.reserve(static_cast<size_t>(m_dataset.size()) * outDim);
+  for (const synapse::Sample& s : m_dataset.samples) {
+    for (int i = 0; i < inDim; ++i)
+      m_flatIn.push_back(i < static_cast<int>(s.input.size()) ? s.input[i] : 0.0f);
+    for (int o = 0; o < outDim; ++o)
+      m_flatOut.push_back(o < static_cast<int>(s.target.size()) ? s.target[o] : 0.0f);
+  }
+  m_flatDirty = false;
+}
+
+// One full-batch gradient-descent step on the GPU.
+float EngineBridge::run_one_epoch_gpu() {
+  const int n = m_dataset.size();
+  if (n == 0) return 0.0f;
+  ensureFlatDataset();
+  const float l = m_net.train_epoch_batched(m_flatIn, m_flatOut, n, static_cast<float>(m_lr));
+  ++m_epoch;
+  return l;
+}
+
 // Re-run the forward pass on the input the user is looking at, so the graph and
 // the prediction update live as the weights change during training.
 void EngineBridge::refreshDisplay() {
@@ -696,7 +740,7 @@ void EngineBridge::onTrainTick() {
   float last = static_cast<float>(m_currentLoss);
   int did = 0;
   do {
-    last = run_one_epoch();
+    last = m_gpuTraining ? run_one_epoch_gpu() : run_one_epoch();
     ++did;
   } while (t.elapsed() < 20 && did < 2000);
 
@@ -732,7 +776,7 @@ void EngineBridge::trainEpoch() {
   m_timer.stop();
   setPlaying(false);
   seedInitialLoss();
-  m_currentLoss = run_one_epoch();
+  m_currentLoss = m_gpuTraining ? run_one_epoch_gpu() : run_one_epoch();
   m_lossHistory.push_back(m_currentLoss);
   if (m_lossHistory.size() > 1000) m_lossHistory.removeFirst();
   refreshDisplay();
@@ -893,6 +937,7 @@ void EngineBridge::loadBlueprint(const QString& path) {
   m_seed = 42;  // deterministic fresh start per blueprint
 
   emit blueprintChanged();
+  m_flatDirty = true;
   emit datasetChanged();
   rebuild();  // build the net + run a zeros pass (emits topology + activations)
 

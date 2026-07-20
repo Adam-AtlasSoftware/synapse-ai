@@ -37,6 +37,10 @@ int main(int argc, char* argv[]) {
                                            !qgetenv("SYNAPSE_DATAMANAGER").isEmpty());
   engine.rootContext()->setContextProperty("grabPath",
                                            QString::fromUtf8(qgetenv("SYNAPSE_GRAB")));
+  engine.rootContext()->setContextProperty("startAdvanced",
+                                           !qgetenv("SYNAPSE_ADVANCED").isEmpty());
+  engine.rootContext()->setContextProperty("selectNeuron",
+                                           QString::fromUtf8(qgetenv("SYNAPSE_SELECT")));
 
   engine.loadFromModule("SynapseDashboard", "Main");
   if (engine.rootObjects().isEmpty())

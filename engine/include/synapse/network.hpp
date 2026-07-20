@@ -70,6 +70,12 @@ class Network {
   bool learn_step_advance();
   bool learn_active() const;
 
+  // Batched (full-batch) gradient-descent step on the GPU. `inputs` is N*input_dim and
+  // `targets` is N*output_dim (row-major). Returns the mean loss. Far faster for larger
+  // models than per-sample SGD — real matrix ops instead of thousands of tiny kernels.
+  float train_epoch_batched(const std::vector<float>& inputs, const std::vector<float>& targets,
+                            int n, float lr);
+
   // Attach a telemetry sink (may be nullptr). Re-emits topology immediately so a
   // freshly-attached GUI can lay out the graph before the first forward pass.
   void set_observer(Observer* obs);

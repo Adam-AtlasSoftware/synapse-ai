@@ -14,6 +14,9 @@ ApplicationWindow {
 
     readonly property var activationOptions: ["linear", "sigmoid", "relu", "tanh", "softmax"]
 
+    // Beginner view keeps it simple; advanced view reveals per-layer stats/histograms.
+    property bool advanced: false
+
     // Which dataset example the Data panel is browsing.
     property int exampleIndex: 0
 
@@ -32,15 +35,57 @@ ApplicationWindow {
         return "Ready"
     }
 
+    // Are we mid-way through a stepped forward/backward pass?
+    function isStepping() {
+        var p = bridge.phase
+        return p === "begin" || p === "step" || p === "loss" || p === "backward"
+               || p === "update" || p === "done"
+    }
+    // Plain-language narration of the current step — the guided tutorial voice.
+    function stepNarration() {
+        var p = bridge.phase
+        var ly = bridge.layers[bridge.activeLayer]
+        var name = ly ? ly.name : "this layer"
+        var act = ly ? ly.activation : ""
+        if (p === "begin")    return qsTr("Input loaded. Press Step to push it through the first layer.")
+        if (p === "step")     return qsTr("Forward · ") + name + qsTr(": each neuron multiplies its inputs by its weights, sums them (plus a bias), then applies ") + act + "."
+        if (p === "loss")     return qsTr("Loss: the output is compared to the correct answer — the gap is the error to reduce.")
+        if (p === "backward") return qsTr("Backward · ") + name + qsTr(": working out how much each neuron here contributed to the error (its gradient).")
+        if (p === "update")   return qsTr("Update: every weight nudges a little against its gradient — the network just learned a bit.")
+        if (p === "done")     return qsTr("Forward pass complete — that's the network's prediction.")
+        return ""
+    }
+
     Connections {
         target: bridge
         function onDatasetChanged() { win.exampleIndex = 0 }
         function onErrorOccurred(message) { errorBar.flash(message) }
     }
 
-    Component.onCompleted: if (autoOpenDataManager) dataManager.show()
+    // Dev/demo hook: SYNAPSE_GRAB=<path> renders the main window to a PNG and quits.
+    // (SYNAPSE_DATAMANAGER + SYNAPSE_GRAB captures the data-manager window instead.)
+    Timer {
+        running: (typeof grabPath !== 'undefined' && grabPath && grabPath.length > 0)
+                 && !(typeof autoOpenDataManager !== 'undefined' && autoOpenDataManager)
+        interval: 1200
+        onTriggered: {
+            if (!rootRow.grabToImage(function(r) { r.saveToFile(grabPath); Qt.quit() }))
+                Qt.quit()
+        }
+    }
+
+    Component.onCompleted: {
+        if (autoOpenDataManager) dataManager.show()
+        if (typeof startAdvanced !== 'undefined' && startAdvanced) win.advanced = true
+        if (typeof selectNeuron !== 'undefined' && selectNeuron && selectNeuron.length > 0) {
+            var parts = selectNeuron.split(",")
+            netView.selCol = parseInt(parts[0])
+            netView.selNeuron = parseInt(parts[1])
+        }
+    }
 
     RowLayout {
+        id: rootRow
         anchors.fill: parent
         spacing: 0
 
@@ -107,6 +152,9 @@ ApplicationWindow {
                     Item { Layout.fillWidth: true }
                     Label { text: qsTr("device:"); color: "#8b949e"; font.pixelSize: 12 }
                     Label { text: bridge.deviceName; color: "#3fb950"; font.pixelSize: 12 }
+                    Rectangle { implicitWidth: 1; implicitHeight: 24; color: "#30363d" }
+                    Label { text: qsTr("Advanced"); color: "#8b949e"; font.pixelSize: 12 }
+                    Switch { checked: win.advanced; onToggled: win.advanced = checked }
                 }
             }
 
@@ -114,6 +162,28 @@ ApplicationWindow {
                 id: netView
                 Layout.fillWidth: true
                 Layout.fillHeight: true
+            }
+
+            // Guided narration while stepping; a beginner explainer otherwise.
+            Rectangle {
+                Layout.fillWidth: true
+                implicitHeight: 42
+                visible: win.isStepping() || !win.advanced
+                color: win.isStepping() ? "#1b2230" : "#161b22"
+                Label {
+                    anchors.fill: parent
+                    anchors.margins: 10
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                    wrapMode: Text.WordWrap
+                    elide: Text.ElideRight
+                    text: win.isStepping()
+                          ? win.stepNarration()
+                          : qsTr("Each circle is a neuron (its color = its current value); the lines are weights. "
+                                 + "Set the input and press Run — or Train to teach it. Flip “Advanced” for the numbers.")
+                    color: win.isStepping() ? "#e6edf3" : "#8b949e"
+                    font.pixelSize: 12
+                }
             }
         }
 
@@ -123,14 +193,33 @@ ApplicationWindow {
             Layout.fillHeight: true
             color: "#12161c"
 
-            ScrollView {
+            ColumnLayout {
                 anchors.fill: parent
-                contentWidth: availableWidth
-                clip: true
+                spacing: 0
 
-                ColumnLayout {
-                    width: 340
-                    spacing: 16
+                TabBar {
+                    id: actionsTab
+                    Layout.fillWidth: true
+                    TabButton { text: qsTr("Run") }
+                    TabButton { text: qsTr("Train") }
+                    TabButton { text: qsTr("Model") }
+                    TabButton { text: qsTr("Info") }
+                }
+
+                StackLayout {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    currentIndex: actionsTab.currentIndex
+
+                    // ══ Run tab: inputs + playback ══════════════════════════
+                    ScrollView {
+                        id: sv0
+                        contentWidth: availableWidth
+                        clip: true
+
+                        ColumnLayout {
+                            width: sv0.availableWidth
+                            spacing: 16
 
                     // ── Inputs ──────────────────────────────────────────────
                     GroupBox {
@@ -267,6 +356,20 @@ ApplicationWindow {
                         }
                     }
 
+                            Item { Layout.fillHeight: true }
+                        }
+                    }
+
+                    // ══ Train tab: training + data ══════════════════════════
+                    ScrollView {
+                        id: sv1
+                        contentWidth: availableWidth
+                        clip: true
+
+                        ColumnLayout {
+                            width: sv1.availableWidth
+                            spacing: 16
+
                     // ── Training: backprop + SGD, watch the loss fall ──────────
                     GroupBox {
                         Layout.fillWidth: true
@@ -324,6 +427,21 @@ ApplicationWindow {
                                         text: bridge.learningRate.toFixed(2)
                                         color: "#e6edf3"; Layout.preferredWidth: 34
                                         horizontalAlignment: Text.AlignRight
+                                    }
+                                }
+
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 6
+                                    Label { text: qsTr("compute"); color: "#8b949e"; font.pixelSize: 11 }
+                                    Item { Layout.fillWidth: true }
+                                    Label {
+                                        text: bridge.gpuTraining ? qsTr("GPU (full-batch)") : qsTr("CPU (SGD)")
+                                        color: "#e6edf3"; font.pixelSize: 11
+                                    }
+                                    Switch {
+                                        checked: bridge.gpuTraining
+                                        onToggled: bridge.gpuTraining = checked
                                     }
                                 }
 
@@ -453,6 +571,20 @@ ApplicationWindow {
                         }
                     }
 
+                            Item { Layout.fillHeight: true }
+                        }
+                    }
+
+                    // ══ Model tab ═══════════════════════════════════════════
+                    ScrollView {
+                        id: sv2
+                        contentWidth: availableWidth
+                        clip: true
+
+                        ColumnLayout {
+                            width: sv2.availableWidth
+                            spacing: 16
+
                     // ── Model editor (Tier-1: edits rebuild the net, no recompile) ──
                     GroupBox {
                         Layout.fillWidth: true
@@ -533,6 +665,20 @@ ApplicationWindow {
                         }
                     }
 
+                            Item { Layout.fillHeight: true }
+                        }
+                    }
+
+                    // ══ Info tab: legend + layer stats ══════════════════════
+                    ScrollView {
+                        id: sv3
+                        contentWidth: availableWidth
+                        clip: true
+
+                        ColumnLayout {
+                            width: sv3.availableWidth
+                            spacing: 16
+
                     // ── Legend ──────────────────────────────────────────────
                     GroupBox {
                         Layout.fillWidth: true
@@ -558,7 +704,21 @@ ApplicationWindow {
                         }
                     }
 
-                    Item { Layout.fillHeight: true }
+                    // ── Advanced: per-layer stats + weight histograms ──────────
+                    GroupBox {
+                        Layout.fillWidth: true
+                        Layout.margins: 14
+                        visible: win.advanced
+                        title: qsTr("Layer stats")
+                        StatsPanel {
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                        }
+                    }
+
+                            Item { Layout.fillHeight: true }
+                        }
+                    }
                 }
             }
         }

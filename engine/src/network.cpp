@@ -113,6 +113,11 @@ struct Layer {
   Tensor dW;     // output_dim x input_dim  (∂loss/∂W)
   Tensor db;     // 1 x output_dim          (∂loss/∂b)
   Tensor delta;  // 1 x output_dim          (∂loss/∂pre — the backprop signal)
+
+  // Batched buffers (N x output_dim) for full-batch GPU training. Allocated lazily.
+  Tensor bZ;     // pre-activations for the whole batch
+  Tensor bA;     // activations for the whole batch
+  Tensor bD;     // deltas for the whole batch
 };
 
 struct Network::Impl {
@@ -124,6 +129,11 @@ struct Network::Impl {
   long step = 0;
   int cursor = 0;    // stepped-forward position: index of the next layer to compute
   float last_loss = 0.0f;
+
+  // batched GPU training buffers (sized to the dataset the first time it's used)
+  int batch_n = 0;
+  Tensor bX;  // batch_n x input_dim
+  Tensor bY;  // batch_n x output_dim (last layer)
 
   // stepped learn-step (gradient-flow animation) state
   bool learn_on = false;
@@ -169,6 +179,7 @@ struct Network::Impl {
 
     input.allocate(1, t.input_dim);
     cursor = static_cast<int>(layers.size());  // "done" until a pass is started
+    batch_n = 0;  // force batched buffers to reallocate for the new architecture
     built = true;
     notify_topology();
   }
@@ -425,6 +436,215 @@ struct Network::Impl {
 
   bool learn_active() const { return learn_on; }
 
+  // ── batched GPU training: full-batch gradient descent as matrix operations ──
+  void setup_batch(int N) {
+    if (batch_n == N) return;
+    batch_n = N;
+    bX.allocate(N, topo.input_dim);
+    bY.allocate(N, topo.output_dim());
+    for (Layer& L : layers) {
+      L.bZ.allocate(N, L.info.output_dim);
+      L.bA.allocate(N, L.info.output_dim);
+      L.bD.allocate(N, L.info.output_dim);
+    }
+  }
+
+  // No per-kernel .wait() here — the in-order queue serializes them, and
+  // train_epoch_batched() synchronizes just twice per epoch. That's the whole point.
+  void apply_activation_batched(Activation a, const float* Z, float* A, int N, int outN) {
+    auto& q = queue();
+    const int total = N * outN;
+    switch (a) {
+      case Activation::Linear:
+        q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> i) { A[i] = Z[i]; });
+        break;
+      case Activation::Sigmoid:
+        q.parallel_for(sycl::range<1>(total),
+                       [=](sycl::id<1> i) { A[i] = 1.0f / (1.0f + std::exp(-Z[i])); });
+        break;
+      case Activation::ReLU:
+        q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> i) {
+          float z = Z[i];
+          A[i] = z > 0.0f ? z : 0.0f;
+        });
+        break;
+      case Activation::Tanh:
+        q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> i) { A[i] = std::tanh(Z[i]); });
+        break;
+      case Activation::Softmax:
+        q.parallel_for(sycl::range<1>(N), [=](sycl::id<1> nn) {
+          const int base = static_cast<int>(nn[0]) * outN;
+          float m = Z[base];
+          for (int j = 1; j < outN; ++j) m = Z[base + j] > m ? Z[base + j] : m;
+          float s = 0.0f;
+          for (int j = 0; j < outN; ++j) {
+            float e = std::exp(Z[base + j] - m);
+            A[base + j] = e;
+            s += e;
+          }
+          for (int j = 0; j < outN; ++j) A[base + j] /= s;
+        });
+        break;
+    }
+  }
+
+  // bZ = prev · Wᵀ + b (one GPU thread per (sample, neuron)), then bA = act(bZ).
+  void forward_layer_batched(Layer& L, const float* prev, int inN) {
+    const int outN = L.info.output_dim, N = batch_n;
+    const float* w = L.W.data;
+    const float* b = L.b.data;
+    float* Z = L.bZ.data;
+    queue().parallel_for(sycl::range<2>(N, outN), [=](sycl::id<2> idx) {
+      const int n = idx[0], o = idx[1];
+      const float* wr = w + o * inN;
+      const float* xr = prev + n * inN;
+      float s = b[o];
+      for (int i = 0; i < inN; ++i) s += wr[i] * xr[i];
+      Z[n * outN + o] = s;
+    });
+    apply_activation_batched(L.info.activation, L.bZ.data, L.bA.data, N, outN);
+  }
+
+  void output_delta_batched(Layer& L) {
+    const int outN = L.info.output_dim, N = batch_n, total = N * outN;
+    const float* A = L.bA.data;
+    const float* Y = bY.data;
+    const float* Z = L.bZ.data;
+    float* D = L.bD.data;
+    const Activation act = L.info.activation;
+    queue().parallel_for(sycl::range<1>(total), [=](sycl::id<1> i) {
+      const float d = A[i] - Y[i];
+      if (act == Activation::Softmax) {
+        D[i] = d;
+        return;
+      }
+      float dv = 1.0f;
+      if (act == Activation::Sigmoid) dv = A[i] * (1.0f - A[i]);
+      else if (act == Activation::Tanh) dv = 1.0f - A[i] * A[i];
+      else if (act == Activation::ReLU) dv = Z[i] > 0.0f ? 1.0f : 0.0f;
+      D[i] = d * dv;
+    });
+  }
+
+  void hidden_delta_batched(Layer& L, Layer& next) {
+    const int units = L.info.output_dim, N = batch_n;
+    const int nextOut = next.info.output_dim, nextIn = next.info.input_dim;
+    const float* Wn = next.W.data;
+    const float* Dn = next.bD.data;
+    float* D = L.bD.data;
+    const float* A = L.bA.data;
+    const float* Z = L.bZ.data;
+    const Activation act = L.info.activation;
+    queue().parallel_for(sycl::range<2>(N, units), [=](sycl::id<2> idx) {
+      const int n = idx[0], i = idx[1];
+      float s = 0.0f;
+      for (int o = 0; o < nextOut; ++o) s += Wn[o * nextIn + i] * Dn[n * nextOut + o];
+      const int p = n * units + i;
+      float dv = 1.0f;
+      if (act == Activation::Sigmoid) dv = A[p] * (1.0f - A[p]);
+      else if (act == Activation::Tanh) dv = 1.0f - A[p] * A[p];
+      else if (act == Activation::ReLU) dv = Z[p] > 0.0f ? 1.0f : 0.0f;
+      D[p] = s * dv;
+    });
+  }
+
+  // dW[o,i] = (1/N) Σ_n D[n,o]·Aprev[n,i];  db[o] = (1/N) Σ_n D[n,o].
+  void gradients_batched(Layer& L, const float* Aprev, int inN, float invN) {
+    const int outN = L.info.output_dim, N = batch_n;
+    const float* D = L.bD.data;
+    float* dW = L.dW.data;
+    float* db = L.db.data;
+    queue().parallel_for(sycl::range<2>(outN, inN), [=](sycl::id<2> idx) {
+      const int o = idx[0], i = idx[1];
+      float s = 0.0f;
+      for (int n = 0; n < N; ++n) s += D[n * outN + o] * Aprev[n * inN + i];
+      dW[o * inN + i] = s * invN;
+    });
+    queue().parallel_for(sycl::range<1>(outN), [=](sycl::id<1> oo) {
+      const int o = oo[0];
+      float s = 0.0f;
+      for (int n = 0; n < N; ++n) s += D[n * outN + o];
+      db[o] = s * invN;
+    });
+  }
+
+  void update_params_batched(float lr) {
+    for (Layer& L : layers) {
+      float* W = L.W.data;
+      const float* dW = L.dW.data;
+      const int wsz = L.W.size();
+      queue().parallel_for(sycl::range<1>(wsz), [=](sycl::id<1> i) { W[i] -= lr * dW[i]; });
+      float* b = L.b.data;
+      const float* db = L.db.data;
+      const int bsz = L.b.size();
+      queue().parallel_for(sycl::range<1>(bsz), [=](sycl::id<1> i) { b[i] -= lr * db[i]; });
+    }
+  }
+
+  float batched_loss() {
+    Layer& last = layers.back();
+    const int outN = last.info.output_dim, N = batch_n;
+    const float* A = last.bA.data;
+    const float* Y = bY.data;
+    float sum = 0.0f;
+    if (last.info.activation == Activation::Softmax) {
+      for (int n = 0; n < N; ++n)
+        for (int j = 0; j < outN; ++j)
+          sum -= Y[n * outN + j] * std::log(std::max(A[n * outN + j], 1e-9f));
+    } else {
+      for (int n = 0; n < N; ++n) {
+        float s = 0.0f;
+        for (int j = 0; j < outN; ++j) {
+          float d = A[n * outN + j] - Y[n * outN + j];
+          s += d * d;
+        }
+        sum += 0.5f * s;
+      }
+    }
+    return sum / static_cast<float>(N);
+  }
+
+  // One full-batch gradient-descent step on the GPU. inputs is N*input_dim, targets
+  // is N*output_dim (row-major). Returns the mean loss over the batch.
+  float train_epoch_batched(const std::vector<float>& inputs, const std::vector<float>& targets,
+                            int N, float lr) {
+    if (!built || N <= 0) return 0.0f;
+    setup_batch(N);
+    const int inDim = topo.input_dim, outDim = topo.output_dim();
+    const int nin = std::min(N * inDim, static_cast<int>(inputs.size()));
+    const int nout = std::min(N * outDim, static_cast<int>(targets.size()));
+    for (int i = 0; i < nin; ++i) bX.data[i] = inputs[i];
+    for (int i = 0; i < nout; ++i) bY.data[i] = targets[i];
+
+    const float* prev = bX.data;
+    int inN = inDim;
+    for (Layer& L : layers) {
+      forward_layer_batched(L, prev, inN);
+      prev = L.bA.data;
+      inN = L.info.output_dim;
+    }
+    queue().wait();  // forward kernels done → safe to read the activations on the host
+
+    const float meanLoss = batched_loss();
+
+    output_delta_batched(layers.back());
+    for (int k = static_cast<int>(layers.size()) - 2; k >= 0; --k)
+      hidden_delta_batched(layers[k], layers[k + 1]);
+
+    const float invN = 1.0f / static_cast<float>(N);
+    const float* Aprev = bX.data;
+    int ain = inDim;
+    for (int k = 0; k < static_cast<int>(layers.size()); ++k) {
+      gradients_batched(layers[k], Aprev, ain, invN);
+      Aprev = layers[k].bA.data;
+      ain = layers[k].info.output_dim;
+    }
+    update_params_batched(lr);
+    queue().wait();  // all epoch kernels finished before the next epoch touches the buffers
+    ++step;
+    return meanLoss;
+  }
+
   // Compare analytic gradients (backprop) to numerical ones (finite differences).
   // Returns the largest relative error over all parameters — tiny means backprop is right.
   double gradient_check(const std::vector<float>& in, const std::vector<float>& target) {
@@ -509,6 +729,10 @@ void Network::begin_learn_step(const std::vector<float>& in, const std::vector<f
 }
 bool Network::learn_step_advance() { return impl_->learn_step_advance(); }
 bool Network::learn_active() const { return impl_->learn_active(); }
+float Network::train_epoch_batched(const std::vector<float>& inputs,
+                                   const std::vector<float>& targets, int n, float lr) {
+  return impl_->train_epoch_batched(inputs, targets, n, lr);
+}
 
 void Network::set_observer(Observer* obs) {
   impl_->obs = obs;

@@ -37,6 +37,8 @@ class EngineBridge : public QObject, public synapse::Observer {
   Q_PROPERTY(QVariantList deltas READ deltas NOTIFY activationsChanged)
   // grads: [{rows,cols,values} per layer] = ∂loss/∂W (edge gradient, backprop viz).
   Q_PROPERTY(QVariantList grads READ grads NOTIFY activationsChanged)
+  // biases: [[...] per layer] — one bias per neuron (for the neuron inspector).
+  Q_PROPERTY(QVariantList biases READ biases NOTIFY activationsChanged)
   // --- playback state (watch the forward pass move one layer at a time) ----
   Q_PROPERTY(int speedMs READ speedMs WRITE setSpeedMs NOTIFY speedChanged)
   Q_PROPERTY(bool playing READ playing NOTIFY playbackChanged)
@@ -70,6 +72,8 @@ class EngineBridge : public QObject, public synapse::Observer {
   Q_PROPERTY(double currentLoss READ currentLoss NOTIFY trainingProgress)
   Q_PROPERTY(QVariantList lossHistory READ lossHistory NOTIFY trainingProgress)
   Q_PROPERTY(bool trained READ trained NOTIFY trainingProgress)
+  // gpuTraining: full-batch gradient descent on the GPU vs per-sample SGD on the CPU.
+  Q_PROPERTY(bool gpuTraining READ gpuTraining WRITE setGpuTraining NOTIFY gpuTrainingChanged)
 
   // --- input + dataset -----------------------------------------------------
   // current input vector — the input controls bind to this and write it back.
@@ -89,6 +93,7 @@ class EngineBridge : public QObject, public synapse::Observer {
   QVariantList weights() const { return m_weights; }
   QVariantList deltas() const { return m_deltas; }
   QVariantList grads() const { return m_grads; }
+  QVariantList biases() const { return m_biases; }
   int speedMs() const { return m_speedMs; }
   void setSpeedMs(int ms);
   bool playing() const { return m_playing; }
@@ -112,6 +117,8 @@ class EngineBridge : public QObject, public synapse::Observer {
   double currentLoss() const { return m_currentLoss; }
   QVariantList lossHistory() const { return m_lossHistory; }
   bool trained() const { return m_epoch > 0; }
+  bool gpuTraining() const { return m_gpuTraining; }
+  void setGpuTraining(bool on);
   QVariantList input() const;
   int datasetSize() const { return m_dataset.size(); }
 
@@ -184,6 +191,7 @@ class EngineBridge : public QObject, public synapse::Observer {
   void trainingChanged();
   void trainingProgress();
   void learningRateChanged();
+  void gpuTrainingChanged();
   void inputChanged();
   void datasetChanged();
   void errorOccurred(const QString& message);
@@ -198,7 +206,9 @@ class EngineBridge : public QObject, public synapse::Observer {
   void setTraining(bool training);
   std::vector<float> toVector(const QVariantList& input) const;
   void scanBlueprints();      // discover the template files on disk
-  float run_one_epoch();      // shuffle + one SGD pass over the dataset; returns avg loss
+  float run_one_epoch();      // shuffle + one CPU SGD pass over the dataset; returns avg loss
+  float run_one_epoch_gpu();  // one full-batch GPU gradient-descent step
+  void ensureFlatDataset();   // (re)build the flattened input/target arrays for the GPU path
   void refreshDisplay();      // re-run forward on the current input to update the graph
   void seedInitialLoss();     // record the pre-training loss as the curve's first point
 
@@ -212,6 +222,7 @@ class EngineBridge : public QObject, public synapse::Observer {
   QVariantList m_weights;
   QVariantList m_deltas;
   QVariantList m_grads;
+  QVariantList m_biases;
 
   QTimer m_timer;
   int m_speedMs = 600;
@@ -242,4 +253,9 @@ class EngineBridge : public QObject, public synapse::Observer {
   double m_currentLoss = 0.0;
   QVariantList m_lossHistory;
   unsigned m_seed = 42;
+
+  bool m_gpuTraining = false;
+  std::vector<float> m_flatIn;   // N*input_dim, cached for the GPU batched path
+  std::vector<float> m_flatOut;  // N*output_dim
+  bool m_flatDirty = true;
 };

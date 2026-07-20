@@ -24,6 +24,7 @@ qt_add_qml_module(synapse_dashboard
     qml/PixelGrid.qml
     qml/LossChart.qml
     qml/DataManager.qml
+    qml/StatsPanel.qml
 )
 
 # Lets the bridge find the bundled model specs at runtime during development.

@@ -46,23 +46,45 @@ int main(int argc, char** argv) {
       return 2;
     }
 
-    // 2) Train with plain SGD and watch the loss fall.
+    // 2) Train and watch the loss fall — per-sample CPU SGD, or full-batch GPU.
     std::mt19937 rng(1);
     const float lr = argc > 2 ? std::stof(argv[2]) : 0.3f;
     const int epochs = argc > 3 ? std::stoi(argv[3]) : 5000;
+    const bool gpu = argc > 4 && std::string(argv[4]) == "gpu";
+
+    const int inDim = net.topology().input_dim;
+    const int outDim = net.topology().output_dim();
+    const int N = ds.size();
+    std::vector<float> flatIn, flatOut;
+    if (gpu) {
+      flatIn.reserve(N * inDim);
+      flatOut.reserve(N * outDim);
+      for (const Sample& s : ds.samples) {
+        for (int i = 0; i < inDim; ++i)
+          flatIn.push_back(i < static_cast<int>(s.input.size()) ? s.input[i] : 0.0f);
+        for (int o = 0; o < outDim; ++o)
+          flatOut.push_back(o < static_cast<int>(s.target.size()) ? s.target[o] : 0.0f);
+      }
+    }
+
     std::vector<int> order(ds.size());
     std::iota(order.begin(), order.end(), 0);
     float firstLoss = 0.0f, lastLoss = 0.0f;
     for (int e = 0; e < epochs; ++e) {
-      std::shuffle(order.begin(), order.end(), rng);
       float epochLoss = 0.0f;
-      for (int idx : order)
-        epochLoss += net.train_step(ds.samples[idx].input, ds.samples[idx].target, lr);
-      epochLoss /= ds.size();
+      if (gpu) {
+        epochLoss = net.train_epoch_batched(flatIn, flatOut, N, lr);
+      } else {
+        std::shuffle(order.begin(), order.end(), rng);
+        for (int idx : order)
+          epochLoss += net.train_step(ds.samples[idx].input, ds.samples[idx].target, lr);
+        epochLoss /= ds.size();
+      }
       if (e == 0) firstLoss = epochLoss;
       lastLoss = epochLoss;
     }
-    std::cout << "loss: " << firstLoss << "  ->  " << lastLoss << "\n";
+    std::cout << (gpu ? "[gpu batched] " : "[cpu sgd] ") << "loss: " << firstLoss << "  ->  "
+              << lastLoss << "\n";
     if (!(lastLoss < firstLoss * 0.5f)) {
       std::cerr << "FAIL: loss did not fall meaningfully\n";
       return 3;

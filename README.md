@@ -118,7 +118,9 @@ choose the "default" preset and hit Build/Run. `clangd` reads the generated
 ## Using the dashboard
 
 When it opens you'll see the network as columns of neurons, with the model name and your
-compute device in the header.
+compute device in the header. The controls on the right are organized into tabs:
+**Run** (inputs + playback), **Train** (training + data), **Model** (architecture), and
+**Info** (legend + per-layer stats).
 
 **Blueprints** — *pick a model with meaning already assigned*
 
@@ -157,6 +159,11 @@ You can also launch straight into one:
 **Reading the picture**
 - **Nodes** are neurons. Their color shows the current activation value: **amber** =
   positive, **slate/grey** = near zero, **blue** = negative. The number inside is the value.
+- **Click any neuron** to open the inspector — it breaks down exactly how that neuron
+  computes: `value = activation(pre-activation)`, and `pre-activation = bias + Σ(input × weight)`
+  with the biggest contributing inputs listed. Click ✕ (or another neuron) to change it.
+- When you **step** a forward or backward pass, a caption below the graph narrates each stage
+  in plain language ("Forward · L0: each neuron multiplies its inputs by its weights…").
 - **Edges** are weights. Same color meaning (amber positive, blue negative); thicker/brighter
   = larger magnitude.
 - **Columns** are laid out straight from the model's dimensions — the leftmost is your input.
@@ -186,10 +193,12 @@ You can also launch straight into one:
   weight (the chain rule, applied layer by layer), then each weight moves a little downhill.
   That math is verified against finite differences in the test suite (`ctest`).
 - `SYNAPSE_AUTOTRAIN=1 ./build/dashboard/synapse_dashboard` starts training on launch.
-- **Speed**: training runs on the **CPU (host)** — for single-sample SGD that's far faster than
-  launching thousands of tiny GPU kernels, and each training tick is time-bounded so the UI
-  stays responsive on large models. The GPU still powers inference and the gradient-flow
-  animation. (True GPU-accelerated training would come from batching — a future step.)
+- **Compute** (toggle in the Training panel): **CPU (SGD)** does per-sample stochastic gradient
+  descent on the host; **GPU (full-batch)** does full-batch gradient descent as real matrix
+  operations on the GPU (in-order queue, two syncs per epoch). Both are gradient-checked in the
+  tests. On this AdaptiveCpp-JIT + GPU combo the two are roughly **on par** for these dataset
+  sizes — the GPU's edge only shows with large batches, since per-kernel launch overhead caps
+  the gains at small scale. Each training tick is time-bounded so the UI stays smooth either way.
 
 **Data** — *see what it learns from, and teach it yourself*
 - The **Data** panel browses the training examples (◀ / ▶). **Show this example** loads it into
@@ -274,7 +283,10 @@ The code is built up in the same order the concepts build on each other:
       control, a **dataset for every blueprint**, **dataset browsing + draw-your-own
       examples**, and a **gradient-flow animation** — watch one SGD step in slow motion
       (forward → loss → backprop layer-by-layer → weight update).
-- [ ] **Phase 5** — beginner vs advanced views (histograms, per-layer stats, annotations)
+- [~] **Phase 5** (in progress) — beginner vs advanced views: an **Advanced** toggle (header)
+      reveals a **Layer stats** panel with per-layer activation/weight/gradient μ·σ and live
+      **weight histograms**; beginner mode adds plain-language captions. (More annotations and
+      activation histograms to come.)
 - [ ] **Phase 6** — GUI-driven C++ recompile (Tier-2), engine as a separate process over IPC
 
 ---

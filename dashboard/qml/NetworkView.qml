@@ -25,6 +25,10 @@ Item {
     property var grads: bridge.grads
     property color bg: "#0d1117"
 
+    // Clicked neuron (column index, neuron index within the column); -1 = none.
+    property int selCol: -1
+    property int selNeuron: -1
+
     // ── layout helpers (shared by the edge Canvas and the node Repeater) ──────
     function numCols() { return view.columns ? view.columns.length : 0 }
 
@@ -119,6 +123,35 @@ Item {
             return view.gradColor(Math.abs(view.deltaAt(k, i)) / view.colMaxAbsDelta(k))
         return view.activationColor(view.activationAt(k, i))
     }
+
+    // ── neuron inspector: break down how the selected neuron computes ─────────
+    function selBias() {
+        var b = bridge.biases[view.selCol - 1]
+        return (b && view.selNeuron < b.length) ? b[view.selNeuron] : 0
+    }
+    // Each incoming input's contribution: previous activation × its weight.
+    function selContribs() {
+        var w = bridge.weights[view.selCol - 1]
+        if (!w || !w.values) return []
+        var inN = view.colCount(view.selCol - 1), o = view.selNeuron, arr = []
+        for (var i = 0; i < inN; ++i) {
+            var a = view.activationAt(view.selCol - 1, i)
+            var wt = w.values[o * inN + i]
+            arr.push({ j: i, a: a, w: wt, c: a * wt })
+        }
+        arr.sort(function (x, y) { return Math.abs(y.c) - Math.abs(x.c) })
+        return arr
+    }
+    function selPreact() {
+        var s = view.selBias(), c = view.selContribs()
+        for (var i = 0; i < c.length; ++i) s += c[i].c
+        return s
+    }
+    function selActName() {
+        var ly = bridge.layers[view.selCol - 1]
+        return ly ? ly.activation : ""
+    }
+    function num(x) { return (x >= 0 ? " " : "") + x.toFixed(3) }
 
     // Diverging colormap: negative → blue, ~0 → slate, positive → amber.
     function mix(a, b, f) {
@@ -264,16 +297,26 @@ Item {
                     radius: r
                     x: view.nodeX(columnItem.colIndex) - r
                     y: view.nodeY(columnItem.colIndex, index, columnItem.count) - r
+                    readonly property bool selected: columnItem.colIndex === view.selCol
+                                                     && neuron.index === view.selNeuron
                     color: view.nodeColor(columnItem.colIndex, neuron.index)
                     opacity: view.isBackward()
                              ? ((columnItem.colIndex === 0 || view.deltaReached(columnItem.colIndex)) ? 1.0 : 0.35)
                              : (view.isPending(columnItem.colIndex) ? 0.28 : 1.0)
-                    border.color: view.isPredicted(columnItem.colIndex, neuron.index) ? "#3fb950"
-                                  : (view.isActive(columnItem.colIndex)
-                                     ? (view.isBackward() ? "#d267ff" : "#e6edf3") : "#0d1117")
-                    border.width: (view.isPredicted(columnItem.colIndex, neuron.index)
+                    border.color: neuron.selected ? "#39c5cf"
+                                  : (view.isPredicted(columnItem.colIndex, neuron.index) ? "#3fb950"
+                                     : (view.isActive(columnItem.colIndex)
+                                        ? (view.isBackward() ? "#d267ff" : "#e6edf3") : "#0d1117"))
+                    border.width: (neuron.selected || view.isPredicted(columnItem.colIndex, neuron.index)
                                    || view.isActive(columnItem.colIndex)) ? 3 : 2
                     Behavior on opacity { NumberAnimation { duration: 150 } }
+
+                    TapHandler {
+                        onTapped: {
+                            view.selCol = columnItem.colIndex
+                            view.selNeuron = neuron.index
+                        }
+                    }
 
                     Text {
                         anchors.centerIn: parent
@@ -313,6 +356,91 @@ Item {
                     ToolTip.visible: hover.hovered
                     ToolTip.text: "value: " + neuron.value.toFixed(4)
                     HoverHandler { id: hover }
+                }
+            }
+        }
+    }
+
+    Connections {
+        target: bridge
+        function onTopologyChanged() { view.selCol = -1; view.selNeuron = -1 }
+    }
+
+    // ── neuron inspector: click a neuron to see exactly how it computes ───────
+    Rectangle {
+        id: inspector
+        visible: view.selCol >= 0
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.margins: 14
+        width: 270
+        height: insp.implicitHeight + 20
+        radius: 8
+        color: "#ee0f151d"
+        border.color: "#39c5cf"
+        border.width: 1
+
+        Column {
+            id: insp
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: 10
+            spacing: 5
+
+            Item {
+                width: parent.width
+                height: title.implicitHeight
+                Text {
+                    id: title
+                    text: view.selCol === 0
+                          ? (qsTr("Input · unit #") + view.selNeuron)
+                          : (qsTr("Neuron  ") + (bridge.layers[view.selCol - 1] ? bridge.layers[view.selCol - 1].name : "")
+                             + qsTr(" · #") + view.selNeuron)
+                    color: "#39c5cf"; font.pixelSize: 13; font.bold: true
+                }
+                Text {
+                    anchors.right: parent.right
+                    text: "✕"; color: "#8b949e"; font.pixelSize: 14
+                    TapHandler { onTapped: { view.selCol = -1; view.selNeuron = -1 } }
+                }
+            }
+
+            // Input column: just the raw value.
+            Text {
+                visible: view.selCol === 0
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: qsTr("value = ") + view.activationAt(0, view.selNeuron).toFixed(3)
+                      + qsTr("  —  a raw input fed into the network.")
+                color: "#c9d1d9"; font.pixelSize: 11
+            }
+
+            // A real neuron: show value = activation(pre-activation), and the breakdown.
+            Column {
+                visible: view.selCol > 0
+                width: parent.width
+                spacing: 3
+                Text {
+                    text: qsTr("value   ") + view.num(view.activationAt(view.selCol, view.selNeuron))
+                          + "  = " + view.selActName() + "(pre-act)"
+                    color: "#e6edf3"; font.pixelSize: 11; font.family: "monospace"
+                }
+                Text {
+                    text: qsTr("pre-act ") + view.num(view.selPreact())
+                          + " = bias " + view.num(view.selBias()) + " + Σ(in×w)"
+                    color: "#c9d1d9"; font.pixelSize: 11; font.family: "monospace"
+                }
+                Text { text: qsTr("top contributions (input × weight):"); color: "#8b949e"; font.pixelSize: 10 }
+                Repeater {
+                    model: view.selCol > 0 ? view.selContribs().slice(0, 5) : []
+                    delegate: Text {
+                        required property var modelData
+                        text: "  " + view.num(modelData.a) + " × " + view.num(modelData.w)
+                              + " = " + view.num(modelData.c)
+                        color: modelData.c >= 0 ? "#f2a33c" : "#4c8dff"
+                        font.pixelSize: 10; font.family: "monospace"
+                    }
                 }
             }
         }
