@@ -5,6 +5,7 @@
 #include <random>
 #include <stdexcept>
 
+#include "activation_registry.hpp"
 #include "engine_context.hpp"
 #include "synapse/model_spec.hpp"
 #include "tensor.hpp"
@@ -16,96 +17,28 @@ using detail::Tensor;
 
 namespace {
 
-// Apply a layer's non-linearity element-wise, pre -> act (length n).
-// The simple element-wise activations run as tiny device kernels. Softmax needs a
-// reduction across the row, which is awkward on-device for a small output layer,
-// so we normalize on the host reading USM shared memory directly.
-void apply_activation(Activation a, const float* pre, float* act, int n) {
-  auto& q = queue();
-  switch (a) {
-    case Activation::Linear:
-      q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { act[i] = pre[i]; }).wait();
-      break;
-    case Activation::Sigmoid:
-      q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
-         act[i] = 1.0f / (1.0f + std::exp(-pre[i]));
-       }).wait();
-      break;
-    case Activation::ReLU:
-      q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
-         act[i] = pre[i] > 0.0f ? pre[i] : 0.0f;
-       }).wait();
-      break;
-    case Activation::Tanh:
-      q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { act[i] = std::tanh(pre[i]); }).wait();
-      break;
-    case Activation::Softmax: {
-      float m = pre[0];
-      for (int i = 1; i < n; ++i) m = pre[i] > m ? pre[i] : m;
-      float sum = 0.0f;
-      for (int i = 0; i < n; ++i) {
-        float e = std::exp(pre[i] - m);
-        act[i] = e;
-        sum += e;
-      }
-      for (int i = 0; i < n; ++i) act[i] /= sum;
-      break;
-    }
-  }
+// The batched GPU trainer runs true device kernels, which can't call the registry's
+// host function pointers, so it keeps a compile-time switch over the built-ins. Custom
+// activations never reach it (train_epoch_batched falls back to the host path for them).
+enum class BuiltinAct { Linear, Sigmoid, ReLU, Tanh, Softmax, Other };
+
+BuiltinAct builtin_act(const std::string& name) {
+  if (name == "linear") return BuiltinAct::Linear;
+  if (name == "sigmoid") return BuiltinAct::Sigmoid;
+  if (name == "relu") return BuiltinAct::ReLU;
+  if (name == "tanh") return BuiltinAct::Tanh;
+  if (name == "softmax") return BuiltinAct::Softmax;
+  return BuiltinAct::Other;  // a custom activation
 }
 
-// Host (CPU) activation — used by the training loop, which runs entirely on the
-// host. For single-sample SGD the per-layer GPU kernel launches (and their waits)
-// cost far more than the arithmetic, so plain CPU loops are dramatically faster;
-// the GPU still powers inference and the gradient-flow animation.
-void apply_activation_host(Activation a, const float* pre, float* act, int n) {
-  switch (a) {
-    case Activation::Linear:
-      for (int i = 0; i < n; ++i) act[i] = pre[i];
-      break;
-    case Activation::Sigmoid:
-      for (int i = 0; i < n; ++i) act[i] = 1.0f / (1.0f + std::exp(-pre[i]));
-      break;
-    case Activation::ReLU:
-      for (int i = 0; i < n; ++i) act[i] = pre[i] > 0.0f ? pre[i] : 0.0f;
-      break;
-    case Activation::Tanh:
-      for (int i = 0; i < n; ++i) act[i] = std::tanh(pre[i]);
-      break;
-    case Activation::Softmax: {
-      float m = pre[0];
-      for (int i = 1; i < n; ++i) m = pre[i] > m ? pre[i] : m;
-      float sum = 0.0f;
-      for (int i = 0; i < n; ++i) {
-        float e = std::exp(pre[i] - m);
-        act[i] = e;
-        sum += e;
-      }
-      for (int i = 0; i < n; ++i) act[i] /= sum;
-      break;
-    }
-  }
-}
+bool is_builtin(const std::string& name) { return builtin_act(name) != BuiltinAct::Other; }
 
 }  // namespace
-
-// The derivative of an activation w.r.t. its pre-activation, expressed in terms of
-// the post-activation `a` (and `z` where needed). Softmax is handled specially by
-// the cross-entropy output delta, so it returns 1 here.
-float act_deriv(Activation a, float post, float pre) {
-  switch (a) {
-    case Activation::Linear: return 1.0f;
-    case Activation::Sigmoid: return post * (1.0f - post);
-    case Activation::Tanh: return 1.0f - post * post;
-    case Activation::ReLU: return pre > 0.0f ? 1.0f : 0.0f;
-    case Activation::Softmax: return 1.0f;
-  }
-  return 1.0f;
-}
 
 // One dense layer's parameters and its scratch buffers for forward + backprop.
 struct Layer {
   LayerInfo info;
+  const ActivationImpl* actx = nullptr;  // resolved from info.activation at build()
   Tensor W;      // output_dim x input_dim  (one row of incoming weights per neuron)
   Tensor b;      // 1 x output_dim
   Tensor pre;    // 1 x output_dim  (pre-activation:  W·x + b)
@@ -153,6 +86,7 @@ struct Network::Impl {
       Layer L;
       L.info = t.layers[k];
       if (L.info.name.empty()) L.info.name = "L" + std::to_string(k);
+      L.actx = &activation_by_name(L.info.activation);  // resolve name → host impl
       const int in = L.info.input_dim;
       const int out = L.info.output_dim;
 
@@ -167,7 +101,7 @@ struct Network::Impl {
       // Weight init that keeps signal variance stable across layers — He for ReLU
       // (which halves the variance), Xavier/Glorot otherwise. Far better than the
       // sandbox's uniform[-1,1], and it's what lets ReLU classifiers actually train.
-      const float limit = (L.info.activation == Activation::ReLU)
+      const float limit = (L.info.activation == "relu")
                               ? std::sqrt(6.0f / static_cast<float>(in))
                               : std::sqrt(6.0f / static_cast<float>(in + out));
       std::uniform_real_distribution<float> dist(-limit, limit);
@@ -222,7 +156,9 @@ struct Network::Impl {
              pre[o] = s;
            }).wait();
 
-    apply_activation(L.info.activation, L.pre.data, L.act.data, outN);
+    // Pre-activation on the GPU; the non-linearity via the registry on the host
+    // (reading the shared USM buffer) — this is what lets custom activations work.
+    L.actx->forward(L.pre.data, L.act.data, outN);
   }
 
   // Snapshot the whole current state (input + every layer's params/activations)
@@ -268,7 +204,7 @@ struct Network::Impl {
         for (int i = 0; i < inN; ++i) s += wr[i] * cur[i];
         pre[o] = s;
       }
-      apply_activation_host(L.info.activation, L.pre.data, L.act.data, outN);
+      L.actx->forward(L.pre.data, L.act.data, outN);
       cur = L.act.data;
     }
   }
@@ -288,7 +224,7 @@ struct Network::Impl {
     const int n = L.info.output_dim;
     const float* a = L.act.data;
     float s = 0.0f;
-    if (L.info.activation == Activation::Softmax) {
+    if (L.actx->is_softmax) {
       for (int i = 0; i < n; ++i) s -= target[i] * std::log(std::max(a[i], 1e-9f));
     } else {
       for (int i = 0; i < n; ++i) {
@@ -310,10 +246,10 @@ struct Network::Impl {
     const int out = L.info.output_dim;
     for (int o = 0; o < out; ++o) {
       const float a = L.act.data[o];
-      if (L.info.activation == Activation::Softmax)
+      if (L.actx->is_softmax)
         L.delta.data[o] = a - target[o];
       else
-        L.delta.data[o] = (a - target[o]) * act_deriv(L.info.activation, a, L.pre.data[o]);
+        L.delta.data[o] = (a - target[o]) * L.actx->derivative(L.pre.data[o], a);
     }
   }
 
@@ -327,7 +263,7 @@ struct Network::Impl {
     for (int i = 0; i < units; ++i) {
       float s = 0.0f;
       for (int o = 0; o < nextOut; ++o) s += next.W.data[o * nextIn + i] * next.delta.data[o];
-      L.delta.data[i] = s * act_deriv(L.info.activation, L.act.data[i], L.pre.data[i]);
+      L.delta.data[i] = s * L.actx->derivative(L.pre.data[i], L.act.data[i]);
     }
   }
 
@@ -451,27 +387,24 @@ struct Network::Impl {
 
   // No per-kernel .wait() here — the in-order queue serializes them, and
   // train_epoch_batched() synchronizes just twice per epoch. That's the whole point.
-  void apply_activation_batched(Activation a, const float* Z, float* A, int N, int outN) {
+  void apply_activation_batched(BuiltinAct a, const float* Z, float* A, int N, int outN) {
     auto& q = queue();
     const int total = N * outN;
     switch (a) {
-      case Activation::Linear:
-        q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> i) { A[i] = Z[i]; });
-        break;
-      case Activation::Sigmoid:
+      case BuiltinAct::Sigmoid:
         q.parallel_for(sycl::range<1>(total),
                        [=](sycl::id<1> i) { A[i] = 1.0f / (1.0f + std::exp(-Z[i])); });
         break;
-      case Activation::ReLU:
+      case BuiltinAct::ReLU:
         q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> i) {
           float z = Z[i];
           A[i] = z > 0.0f ? z : 0.0f;
         });
         break;
-      case Activation::Tanh:
+      case BuiltinAct::Tanh:
         q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> i) { A[i] = std::tanh(Z[i]); });
         break;
-      case Activation::Softmax:
+      case BuiltinAct::Softmax:
         q.parallel_for(sycl::range<1>(N), [=](sycl::id<1> nn) {
           const int base = static_cast<int>(nn[0]) * outN;
           float m = Z[base];
@@ -484,6 +417,10 @@ struct Network::Impl {
           }
           for (int j = 0; j < outN; ++j) A[base + j] /= s;
         });
+        break;
+      case BuiltinAct::Linear:
+      case BuiltinAct::Other:  // custom never reaches the batched path (host fallback)
+        q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> i) { A[i] = Z[i]; });
         break;
     }
   }
@@ -502,7 +439,7 @@ struct Network::Impl {
       for (int i = 0; i < inN; ++i) s += wr[i] * xr[i];
       Z[n * outN + o] = s;
     });
-    apply_activation_batched(L.info.activation, L.bZ.data, L.bA.data, N, outN);
+    apply_activation_batched(builtin_act(L.info.activation), L.bZ.data, L.bA.data, N, outN);
   }
 
   void output_delta_batched(Layer& L) {
@@ -511,17 +448,17 @@ struct Network::Impl {
     const float* Y = bY.data;
     const float* Z = L.bZ.data;
     float* D = L.bD.data;
-    const Activation act = L.info.activation;
+    const BuiltinAct act = builtin_act(L.info.activation);
     queue().parallel_for(sycl::range<1>(total), [=](sycl::id<1> i) {
       const float d = A[i] - Y[i];
-      if (act == Activation::Softmax) {
+      if (act == BuiltinAct::Softmax) {
         D[i] = d;
         return;
       }
       float dv = 1.0f;
-      if (act == Activation::Sigmoid) dv = A[i] * (1.0f - A[i]);
-      else if (act == Activation::Tanh) dv = 1.0f - A[i] * A[i];
-      else if (act == Activation::ReLU) dv = Z[i] > 0.0f ? 1.0f : 0.0f;
+      if (act == BuiltinAct::Sigmoid) dv = A[i] * (1.0f - A[i]);
+      else if (act == BuiltinAct::Tanh) dv = 1.0f - A[i] * A[i];
+      else if (act == BuiltinAct::ReLU) dv = Z[i] > 0.0f ? 1.0f : 0.0f;
       D[i] = d * dv;
     });
   }
@@ -534,16 +471,16 @@ struct Network::Impl {
     float* D = L.bD.data;
     const float* A = L.bA.data;
     const float* Z = L.bZ.data;
-    const Activation act = L.info.activation;
+    const BuiltinAct act = builtin_act(L.info.activation);
     queue().parallel_for(sycl::range<2>(N, units), [=](sycl::id<2> idx) {
       const int n = idx[0], i = idx[1];
       float s = 0.0f;
       for (int o = 0; o < nextOut; ++o) s += Wn[o * nextIn + i] * Dn[n * nextOut + o];
       const int p = n * units + i;
       float dv = 1.0f;
-      if (act == Activation::Sigmoid) dv = A[p] * (1.0f - A[p]);
-      else if (act == Activation::Tanh) dv = 1.0f - A[p] * A[p];
-      else if (act == Activation::ReLU) dv = Z[p] > 0.0f ? 1.0f : 0.0f;
+      if (act == BuiltinAct::Sigmoid) dv = A[p] * (1.0f - A[p]);
+      else if (act == BuiltinAct::Tanh) dv = 1.0f - A[p] * A[p];
+      else if (act == BuiltinAct::ReLU) dv = Z[p] > 0.0f ? 1.0f : 0.0f;
       D[p] = s * dv;
     });
   }
@@ -587,7 +524,7 @@ struct Network::Impl {
     const float* A = last.bA.data;
     const float* Y = bY.data;
     float sum = 0.0f;
-    if (last.info.activation == Activation::Softmax) {
+    if (last.actx->is_softmax) {
       for (int n = 0; n < N; ++n)
         for (int j = 0; j < outN; ++j)
           sum -= Y[n * outN + j] * std::log(std::max(A[n * outN + j], 1e-9f));
@@ -609,8 +546,25 @@ struct Network::Impl {
   float train_epoch_batched(const std::vector<float>& inputs, const std::vector<float>& targets,
                             int N, float lr) {
     if (!built || N <= 0) return 0.0f;
-    setup_batch(N);
     const int inDim = topo.input_dim, outDim = topo.output_dim();
+
+    // The batched GPU kernels only know the built-in activations. If any layer uses a
+    // custom one, fall back to per-sample host SGD (correct, just not GPU-accelerated).
+    bool all_builtin = true;
+    for (const Layer& L : layers)
+      if (!is_builtin(L.info.activation)) { all_builtin = false; break; }
+    if (!all_builtin) {
+      float total = 0.0f;
+      for (int s = 0; s < N; ++s) {
+        std::vector<float> in(inputs.begin() + s * inDim, inputs.begin() + (s + 1) * inDim);
+        std::vector<float> tg(targets.begin() + s * outDim, targets.begin() + (s + 1) * outDim);
+        total += train_step(in, tg, lr);
+      }
+      ++step;
+      return total / static_cast<float>(N);
+    }
+
+    setup_batch(N);
     const int nin = std::min(N * inDim, static_cast<int>(inputs.size()));
     const int nout = std::min(N * outDim, static_cast<int>(targets.size()));
     for (int i = 0; i < nin; ++i) bX.data[i] = inputs[i];

@@ -12,3 +12,10 @@ add_test(NAME train_xor COMMAND train_smoke ${CMAKE_SOURCE_DIR}/models/blueprint
 add_test(NAME train_classifier COMMAND train_smoke ${CMAKE_SOURCE_DIR}/models/blueprints/seven_segment.json 0.1 5000)
 # Full-batch GPU training path (batched matrix ops).
 add_test(NAME train_gpu_batched COMMAND train_smoke ${CMAKE_SOURCE_DIR}/models/blueprints/seven_segment.json 0.5 8000 gpu)
+
+# Tier-2: a custom activation (registered as C++) is gradient-correct and trains. Opts
+# into the internal engine header, so it also proves the registry works end to end.
+add_executable(custom_activation_smoke custom_activation_smoke.cpp)
+target_link_libraries(custom_activation_smoke PRIVATE synapse_engine)
+target_include_directories(custom_activation_smoke PRIVATE ${CMAKE_SOURCE_DIR}/engine/src)
+add_test(NAME custom_activation COMMAND custom_activation_smoke)

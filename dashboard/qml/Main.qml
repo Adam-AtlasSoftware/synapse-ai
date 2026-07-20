@@ -12,7 +12,9 @@ ApplicationWindow {
     title: appTitle
     color: "#0d1117"
 
-    readonly property var activationOptions: ["linear", "sigmoid", "relu", "tanh", "softmax"]
+    // Every activation the engine knows — built-ins plus any custom C++ ones compiled
+    // in via the Code Lab. Sourced from the engine so new activations just appear.
+    readonly property var activationOptions: bridge.activationNames
 
     // Beginner view keeps it simple; advanced view reveals per-layer stats/histograms.
     property bool advanced: false
@@ -67,6 +69,7 @@ ApplicationWindow {
     Timer {
         running: (typeof grabPath !== 'undefined' && grabPath && grabPath.length > 0)
                  && !(typeof autoOpenDataManager !== 'undefined' && autoOpenDataManager)
+                 && !(typeof autoOpenCodeLab !== 'undefined' && autoOpenCodeLab)
         interval: 1200
         onTriggered: {
             if (!rootRow.grabToImage(function(r) { r.saveToFile(grabPath); Qt.quit() }))
@@ -76,6 +79,7 @@ ApplicationWindow {
 
     Component.onCompleted: {
         if (autoOpenDataManager) dataManager.show()
+        if (typeof autoOpenCodeLab !== 'undefined' && autoOpenCodeLab) codeLab.show()
         if (typeof startAdvanced !== 'undefined' && startAdvanced) win.advanced = true
         if (typeof selectNeuron !== 'undefined' && selectNeuron && selectNeuron.length > 0) {
             var parts = selectNeuron.split(",")
@@ -104,6 +108,13 @@ ApplicationWindow {
                     anchors.leftMargin: 18
                     anchors.rightMargin: 18
                     spacing: 12
+                    Image {
+                        source: "qrc:/branding/mark-color-1024.png"
+                        sourceSize.width: 34; sourceSize.height: 34
+                        Layout.preferredWidth: 34; Layout.preferredHeight: 34
+                        fillMode: Image.PreserveAspectFit
+                        smooth: true
+                    }
                     Label { text: qsTr("Synapse-AI"); color: "#e6edf3"; font.pixelSize: 20; font.bold: true }
                     Rectangle { implicitWidth: 1; implicitHeight: 24; color: "#30363d" }
                     Label {
@@ -695,6 +706,21 @@ ApplicationWindow {
                                 text: qsTr("↺ Restore default")
                                 onClicked: restoreDialog.open()
                             }
+
+                            Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: "#30363d" }
+
+                            // Tier-2: edit real engine C++ (a new activation), recompile, run.
+                            Button {
+                                Layout.fillWidth: true
+                                text: qsTr("⚙ Custom C++ (activations)…")
+                                onClicked: codeLab.show()
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                text: qsTr("Write a new activation function in C++, then recompile & run — "
+                                         + "the app rebuilds the engine and relaunches with it.")
+                                color: "#8b949e"; font.pixelSize: 10; wrapMode: Text.WordWrap
+                            }
                         }
                     }
 
@@ -759,6 +785,7 @@ ApplicationWindow {
 
     // Dedicated training-data manager (a separate window, opened on demand).
     DataManager { id: dataManager; visible: false }
+    CodeLab { id: codeLab; visible: false }
 
     // Save the current model as a new blueprint.
     Dialog {

@@ -1,5 +1,6 @@
 #include "EngineBridge.h"
 
+#include <QCoreApplication>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -7,6 +8,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QProcess>
 #include <QTextStream>
 #include <algorithm>
 #include <exception>
@@ -15,14 +17,20 @@
 #include <unordered_map>
 #include <vector>
 
+#include "synapse/activation.hpp"
 #include "synapse/device_info.hpp"
 #include "synapse/model_spec.hpp"
 
 #ifndef SYNAPSE_MODELS_DIR
 #define SYNAPSE_MODELS_DIR "models"
 #endif
+#ifndef SYNAPSE_SOURCE_DIR
+#define SYNAPSE_SOURCE_DIR "."
+#endif
+#ifndef SYNAPSE_BUILD_DIR
+#define SYNAPSE_BUILD_DIR "build"
+#endif
 
-using synapse::Activation;
 using synapse::LayerInfo;
 using synapse::StepSnapshot;
 using synapse::TensorView;
@@ -63,8 +71,8 @@ EngineBridge::EngineBridge(QObject* parent) : QObject(parent) {
     m_topo = Topology{};
     m_topo.name = "XOR";
     m_topo.input_dim = 2;
-    m_topo.layers = {LayerInfo{"L0", "dense", 2, 4, Activation::Tanh},
-                     LayerInfo{"L1", "dense", 4, 1, Activation::Sigmoid}};
+    m_topo.layers = {LayerInfo{"L0", "dense", 2, 4, "tanh"},
+                     LayerInfo{"L1", "dense", 4, 1, "sigmoid"}};
     m_inputLayout = "labels";
     m_inputLabels = QVariantList{"A", "B"};
     m_outputLabels = QVariantList{"A XOR B"};
@@ -112,7 +120,7 @@ void EngineBridge::on_topology(const Topology& topo) {
     const LayerInfo& L = topo.layers[k];
     QVariantMap col;
     col["title"] = QString::fromStdString(L.name);
-    col["activation"] = QString::fromStdString(synapse::to_string(L.activation));
+    col["activation"] = QString::fromStdString(L.activation);
     col["count"] = L.output_dim;
     col["kind"] = "dense";
     cols.push_back(col);
@@ -120,7 +128,7 @@ void EngineBridge::on_topology(const Topology& topo) {
     QVariantMap ly;
     ly["index"] = k;
     ly["units"] = L.output_dim;
-    ly["activation"] = QString::fromStdString(synapse::to_string(L.activation));
+    ly["activation"] = QString::fromStdString(L.activation);
     ly["name"] = QString::fromStdString(L.name);
     lys.push_back(ly);
   }
@@ -587,7 +595,7 @@ void EngineBridge::addLayer(int units, const QString& activation) {
   L.type = "dense";
   L.output_dim = units;
   L.input_dim = m_topo.layers.empty() ? m_topo.input_dim : m_topo.layers.back().output_dim;
-  L.activation = synapse::activation_from_string(activation.toStdString());
+  L.activation = activation.toStdString();
   L.name = "L" + std::to_string(m_topo.layers.size());
   m_topo.layers.push_back(L);
   rebuild();
@@ -621,8 +629,80 @@ void EngineBridge::setLayerUnits(int index, int units) {
 
 void EngineBridge::setLayerActivation(int index, const QString& activation) {
   if (index < 0 || index >= static_cast<int>(m_topo.layers.size())) return;
-  m_topo.layers[index].activation = synapse::activation_from_string(activation.toStdString());
+  m_topo.layers[index].activation = activation.toStdString();
   rebuild();
+}
+
+// ── Tier-2 Code Lab: edit engine C++, recompile, relaunch ─────────────────────
+
+QStringList EngineBridge::activationNames() const {
+  QStringList names;
+  for (const std::string& s : synapse::activation_names())
+    names << QString::fromStdString(s);
+  return names;
+}
+
+// The one user-editable engine source the Code Lab reads and writes.
+static QString customActivationPath() {
+  return QString::fromUtf8(SYNAPSE_SOURCE_DIR) + "/engine/src/custom_activations.cpp";
+}
+
+QString EngineBridge::customActivationSource() const {
+  QFile f(customActivationPath());
+  if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return QString();
+  const QString s = QString::fromUtf8(f.readAll());
+  f.close();
+  return s;
+}
+
+void EngineBridge::saveCustomActivationSource(const QString& src) {
+  QFile f(customActivationPath());
+  if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+    emit errorOccurred(QStringLiteral("cannot write %1").arg(customActivationPath()));
+    return;
+  }
+  f.write(src.toUtf8());
+  f.close();
+}
+
+// Rebuild the engine (via the dashboard target, which relinks it in) and, on success,
+// relaunch this exact binary re-opening the current blueprint — the "recompile & run"
+// loop. On failure the compiler output stays on screen and the app keeps running.
+void EngineBridge::rebuildEngine() {
+  if (m_building) return;
+  m_building = true;
+  emit buildingChanged();
+
+  const QString buildDir = QString::fromUtf8(SYNAPSE_BUILD_DIR);
+  m_buildOutput = QStringLiteral("$ cmake --build \"%1\" --target synapse_dashboard\n\n").arg(buildDir);
+  emit buildOutputChanged();
+
+  QProcess* proc = new QProcess(this);
+  proc->setProcessChannelMode(QProcess::MergedChannels);
+  connect(proc, &QProcess::readyReadStandardOutput, this, [this, proc]() {
+    m_buildOutput += QString::fromUtf8(proc->readAllStandardOutput());
+    emit buildOutputChanged();
+  });
+  connect(proc, &QProcess::finished, this, [this, proc](int code, QProcess::ExitStatus status) {
+    proc->deleteLater();
+    m_building = false;
+    emit buildingChanged();
+    if (code == 0 && status == QProcess::NormalExit) {
+      m_buildOutput += QStringLiteral("\n✓ Build succeeded — relaunching with your new code…\n");
+      emit buildOutputChanged();
+      // Re-open the current blueprint in the new process (env is inherited by the child).
+      if (!m_blueprintPath.isEmpty())
+        qputenv("SYNAPSE_BLUEPRINT", QFileInfo(m_blueprintPath).completeBaseName().toUtf8());
+      QProcess::startDetached(QCoreApplication::applicationFilePath(), QStringList{});
+      QCoreApplication::quit();
+    } else {
+      m_buildOutput += QStringLiteral("\n✗ Build failed (exit %1). Fix the errors above and Rebuild.\n").arg(code);
+      emit buildOutputChanged();
+    }
+  });
+  proc->setWorkingDirectory(buildDir);
+  proc->start(QStringLiteral("cmake"), {QStringLiteral("--build"), buildDir,
+                                        QStringLiteral("--target"), QStringLiteral("synapse_dashboard")});
 }
 
 // ── blueprints ───────────────────────────────────────────────────────────────
@@ -849,7 +929,7 @@ void EngineBridge::saveBlueprintAs(const QString& name) {
     QJsonObject lo;
     lo["type"] = QString::fromStdString(L.type);
     lo["units"] = L.output_dim;
-    lo["activation"] = QString::fromStdString(synapse::to_string(L.activation));
+    lo["activation"] = QString::fromStdString(L.activation);
     layers.append(lo);
   }
   root["layers"] = layers;

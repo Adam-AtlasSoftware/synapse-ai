@@ -1,9 +1,12 @@
 #include "synapse/model_spec.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 
+#include "synapse/activation.hpp"
 #include "json.hpp"
 
 namespace synapse {
@@ -29,7 +32,10 @@ Topology parse_topology_json(const std::string& text) {
     if (units <= 0) throw std::runtime_error("layer 'units' must be positive");
     li.output_dim = units;
     li.input_dim = prev;
-    li.activation = activation_from_string(lv.string_or("activation", "sigmoid"));
+    std::string act = lv.string_or("activation", "sigmoid");
+    std::transform(act.begin(), act.end(), act.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    li.activation = activation_exists(act) ? act : "sigmoid";  // unknown → safe default
     li.name = lv.string_or("name", "L" + std::to_string(index));
     t.layers.push_back(std::move(li));
     prev = units;
@@ -56,7 +62,7 @@ std::string topology_to_json(const Topology& t) {
   for (size_t k = 0; k < t.layers.size(); ++k) {
     const LayerInfo& L = t.layers[k];
     os << "    { \"type\": \"" << L.type << "\", \"units\": " << L.output_dim
-       << ", \"activation\": \"" << to_string(L.activation) << "\" }"
+       << ", \"activation\": \"" << L.activation << "\" }"
        << (k + 1 < t.layers.size() ? "," : "") << "\n";
   }
   os << "  ]\n";

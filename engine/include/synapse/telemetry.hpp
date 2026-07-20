@@ -15,20 +15,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
 namespace synapse {
 
-// The non-linearity applied at the output of a layer.
-enum class Activation { Linear, Sigmoid, ReLU, Tanh, Softmax };
-
-std::string to_string(Activation a);
-Activation activation_from_string(const std::string& s);  // case-insensitive
-
 // One layer's shape and role. `input_dim`/`output_dim` are what the GUI uses to
-// draw the incoming edges and the column of neurons this layer produces.
+// draw the incoming edges and the column of neurons this layer produces. The
+// non-linearity is a NAME (e.g. "relu", "softmax", or a user-defined "swish") that
+// the engine resolves through its activation registry — see synapse/activation.hpp.
 struct LayerInfo {
   std::string name;          // "L0", "L1", ... (display + telemetry key)
   std::string type = "dense";
   int input_dim = 0;
   int output_dim = 0;
-  Activation activation = Activation::Sigmoid;
+  std::string activation = "sigmoid";
 };
 
 // The whole network's structure. The first visible column has `input_dim`

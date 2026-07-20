@@ -6,6 +6,7 @@
 #include <random>
 #include <vector>
 
+#include "synapse/activation.hpp"
 #include "synapse/model_spec.hpp"
 #include "synapse/network.hpp"
 #include "synapse/telemetry.hpp"
@@ -29,6 +30,12 @@ class EngineBridge : public QObject, public synapse::Observer {
   Q_PROPERTY(QVariantList columns READ columns NOTIFY topologyChanged)
   // layers: [{index, units, activation, name}] — the editable dense layers only.
   Q_PROPERTY(QVariantList layers READ layers NOTIFY topologyChanged)
+  // activationNames: every activation the engine knows (built-ins + custom C++), for
+  // the layer dropdowns. CONSTANT within a run — new custom ones appear after a rebuild.
+  Q_PROPERTY(QStringList activationNames READ activationNames CONSTANT)
+  // --- Tier-2 "Code Lab": edit the engine's C++, recompile, relaunch --------
+  Q_PROPERTY(QString buildOutput READ buildOutput NOTIFY buildOutputChanged)
+  Q_PROPERTY(bool building READ building NOTIFY buildingChanged)
   // activations: [[...], [...], ...] aligned with columns (current forward pass).
   Q_PROPERTY(QVariantList activations READ activations NOTIFY activationsChanged)
   // weights: [{rows, cols, values}] — one per layer, for drawing edges.
@@ -102,6 +109,9 @@ class EngineBridge : public QObject, public synapse::Observer {
   int activeLayer() const { return m_activeLayer; }
   QString phase() const { return m_phase; }
   QVariantList blueprints() const { return m_blueprints; }
+  QStringList activationNames() const;
+  QString buildOutput() const { return m_buildOutput; }
+  bool building() const { return m_building; }
   QString inputLayout() const { return m_inputLayout; }
   int inputRows() const { return m_inputRows; }
   int inputCols() const { return m_inputCols; }
@@ -182,6 +192,13 @@ class EngineBridge : public QObject, public synapse::Observer {
   Q_INVOKABLE void setLayerUnits(int index, int units);
   Q_INVOKABLE void setLayerActivation(int index, const QString& activation);
 
+  // --- Tier-2: edit real engine C++ (custom activations), recompile, relaunch ---
+  // Read/write the user-editable source; rebuildEngine() saves it, runs the build,
+  // streams output to buildOutput, and (on success) relaunches the app.
+  Q_INVOKABLE QString customActivationSource() const;
+  Q_INVOKABLE void saveCustomActivationSource(const QString& src);
+  Q_INVOKABLE void rebuildEngine();
+
   // --- synapse::Observer ---------------------------------------------------
   void on_topology(const synapse::Topology& topo) override;
   void on_step(const synapse::StepSnapshot& snap) override;
@@ -200,6 +217,8 @@ class EngineBridge : public QObject, public synapse::Observer {
   void inputChanged();
   void datasetChanged();
   void errorOccurred(const QString& message);
+  void buildOutputChanged();
+  void buildingChanged();
 
  private slots:
   void onTick();       // forward-playback timer: advance one layer
@@ -263,4 +282,8 @@ class EngineBridge : public QObject, public synapse::Observer {
   std::vector<float> m_flatIn;   // N*input_dim, cached for the GPU batched path
   std::vector<float> m_flatOut;  // N*output_dim
   bool m_flatDirty = true;
+
+  // Tier-2 "Code Lab": rebuild the engine from edited C++, then relaunch.
+  QString m_buildOutput;
+  bool m_building = false;
 };

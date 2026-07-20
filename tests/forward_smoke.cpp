@@ -18,7 +18,7 @@ struct PrintObserver : Observer {
     std::cout << "topology '" << t.name << "': in=" << t.input_dim;
     for (const auto& L : t.layers)
       std::cout << "  ->  [" << L.name << " " << L.input_dim << "x" << L.output_dim << " "
-                << to_string(L.activation) << "]";
+                << L.activation << "]";
     std::cout << "\n";
   }
   void on_step(const StepSnapshot& s) override {
