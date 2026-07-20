@@ -231,53 +231,17 @@ ApplicationWindow {
                             anchors.fill: parent
                             spacing: 8
 
-                            // GRID blueprints (OCR / shapes): paint the pixels.
-                            PixelGrid {
-                                visible: bridge.inputLayout === "grid"
-                                Layout.alignment: Qt.AlignHCenter
+                            // The input widget adapts to the blueprint: sliders,
+                            // a paintable pixel grid, or a seven-segment display.
+                            InputWidget {
+                                Layout.fillWidth: true
+                                layout: bridge.inputLayout
                                 rows: bridge.inputRows
                                 cols: bridge.inputCols
+                                labels: bridge.inputLabels
+                                dim: bridge.inputDim
                                 values: bridge.input
-                                onPainted: (index, value) => bridge.setInput(index, value)
-                            }
-                            Label {
-                                visible: bridge.inputLayout === "grid"
-                                Layout.fillWidth: true
-                                text: qsTr("Left-drag to draw · right-drag to erase")
-                                color: "#8b949e"; font.pixelSize: 11
-                                horizontalAlignment: Text.AlignHCenter
-                            }
-
-                            // LABELED blueprints (XOR / adder / segments): named sliders.
-                            Repeater {
-                                model: bridge.inputLayout === "labels" ? bridge.inputDim : 0
-                                delegate: RowLayout {
-                                    id: inputRow
-                                    required property int index
-                                    Layout.fillWidth: true
-                                    spacing: 8
-                                    Label {
-                                        text: (bridge.inputLabels[inputRow.index] !== undefined)
-                                              ? bridge.inputLabels[inputRow.index] : ("x" + inputRow.index)
-                                        color: "#8b949e"
-                                        Layout.preferredWidth: 34
-                                        elide: Text.ElideRight
-                                    }
-                                    Slider {
-                                        Layout.fillWidth: true
-                                        from: 0; to: 1; stepSize: 0.05
-                                        value: (bridge.input[inputRow.index] !== undefined)
-                                               ? bridge.input[inputRow.index] : 0
-                                        onMoved: bridge.setInput(inputRow.index, value)
-                                    }
-                                    Label {
-                                        text: ((bridge.input[inputRow.index] !== undefined)
-                                               ? bridge.input[inputRow.index] : 0).toFixed(2)
-                                        color: "#e6edf3"
-                                        Layout.preferredWidth: 40
-                                        horizontalAlignment: Text.AlignRight
-                                    }
-                                }
+                                onEdited: (index, value) => bridge.setInput(index, value)
                             }
 
                             RowLayout {
@@ -380,11 +344,20 @@ ApplicationWindow {
                             anchors.fill: parent
                             spacing: 8
 
-                            Label {
+                            ColumnLayout {
                                 visible: !bridge.hasDataset
                                 Layout.fillWidth: true
-                                text: qsTr("This blueprint has no training data.")
-                                color: "#8b949e"; font.pixelSize: 12; wrapMode: Text.WordWrap
+                                spacing: 8
+                                Label {
+                                    Layout.fillWidth: true
+                                    text: qsTr("No training data yet. Add a few examples — draw or set an input and pick the right answer — then come back here to train.")
+                                    color: "#8b949e"; font.pixelSize: 12; wrapMode: Text.WordWrap
+                                }
+                                Button {
+                                    Layout.fillWidth: true
+                                    text: qsTr("✎ Add training data…")
+                                    onClicked: dataManager.show()
+                                }
                             }
 
                             ColumnLayout {
@@ -464,7 +437,6 @@ ApplicationWindow {
                     GroupBox {
                         Layout.fillWidth: true
                         Layout.margins: 14
-                        visible: bridge.hasDataset || bridge.outputKind === "class"
                         title: qsTr("Data (") + bridge.datasetSize + qsTr(" examples)")
 
                         ColumnLayout {
@@ -473,12 +445,15 @@ ApplicationWindow {
 
                             Label {
                                 Layout.fillWidth: true
-                                text: qsTr("What the network learns from. Browse the examples, or teach it your own.")
+                                text: bridge.datasetSize > 0
+                                      ? qsTr("What the network learns from. Browse the examples, or teach it your own.")
+                                      : qsTr("This blueprint has no examples yet. Open the manager to add some — the network learns from whatever you put here.")
                                 color: "#8b949e"; font.pixelSize: 11; wrapMode: Text.WordWrap
                             }
                             Button {
                                 Layout.fillWidth: true
-                                text: qsTr("⤢ Manage training data…")
+                                text: bridge.datasetSize > 0 ? qsTr("⤢ Manage training data…")
+                                                             : qsTr("✎ Add training data…")
                                 onClicked: dataManager.show()
                             }
 
@@ -595,7 +570,59 @@ ApplicationWindow {
                             anchors.fill: parent
                             spacing: 8
 
+                            // ── Input method: which GUI the blueprint uses for data ──
                             RowLayout {
+                                Layout.fillWidth: true
+                                Label { text: qsTr("Input method"); color: "#8b949e"; Layout.fillWidth: true }
+                                ComboBox {
+                                    id: inputMethodCombo
+                                    Layout.preferredWidth: 150
+                                    model: [qsTr("Sliders"), qsTr("Pixel grid"), qsTr("7-segment")]
+                                    function layoutIndex() {
+                                        return bridge.inputLayout === "grid" ? 1
+                                             : (bridge.inputLayout === "segments" ? 2 : 0)
+                                    }
+                                    Component.onCompleted: currentIndex = layoutIndex()
+                                    Connections {
+                                        target: bridge
+                                        function onBlueprintChanged() {
+                                            inputMethodCombo.currentIndex = inputMethodCombo.layoutIndex()
+                                        }
+                                    }
+                                    onActivated: {
+                                        if (currentIndex === 1)
+                                            bridge.setInputLayout("grid", Math.max(2, bridge.inputRows),
+                                                                          Math.max(2, bridge.inputCols))
+                                        else if (currentIndex === 2)
+                                            bridge.setInputLayout("segments", 1, 7)
+                                        else
+                                            bridge.setInputLayout("labels", 1, 0)
+                                    }
+                                }
+                            }
+
+                            // Grid size — only meaningful for the pixel-grid method.
+                            RowLayout {
+                                visible: bridge.inputLayout === "grid"
+                                Layout.fillWidth: true
+                                Label { text: qsTr("Grid size"); color: "#8b949e"; Layout.fillWidth: true }
+                                SpinBox {
+                                    from: 1; to: 16
+                                    value: bridge.inputRows
+                                    onValueModified: bridge.setInputLayout("grid", value, bridge.inputCols)
+                                }
+                                Label { text: "×"; color: "#8b949e" }
+                                SpinBox {
+                                    from: 1; to: 16
+                                    value: bridge.inputCols
+                                    onValueModified: bridge.setInputLayout("grid", bridge.inputRows, value)
+                                }
+                            }
+
+                            // Input dim — editable only for the slider method (grid and
+                            // segments derive it from their shape).
+                            RowLayout {
+                                visible: bridge.inputLayout === "labels"
                                 Layout.fillWidth: true
                                 Label { text: qsTr("Input dim"); color: "#8b949e"; Layout.fillWidth: true }
                                 SpinBox {
@@ -603,6 +630,12 @@ ApplicationWindow {
                                     value: bridge.inputDim
                                     onValueModified: bridge.setInputDim(value)
                                 }
+                            }
+                            Label {
+                                visible: bridge.inputLayout === "segments"
+                                Layout.fillWidth: true
+                                text: qsTr("7 inputs — segments a–g of the display")
+                                color: "#8b949e"; font.pixelSize: 11
                             }
 
                             Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: "#30363d" }

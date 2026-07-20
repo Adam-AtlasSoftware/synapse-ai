@@ -65,7 +65,9 @@ class EngineBridge : public QObject, public synapse::Observer {
   Q_PROPERTY(QString predictedLabel READ predictedLabel NOTIFY activationsChanged)
 
   // --- training ------------------------------------------------------------
-  Q_PROPERTY(bool hasDataset READ hasDataset NOTIFY blueprintChanged)
+  // datasetChanged (not blueprintChanged) so the UI flips the moment the first
+  // example is added — loadBlueprint emits datasetChanged too, so loads still update.
+  Q_PROPERTY(bool hasDataset READ hasDataset NOTIFY datasetChanged)
   Q_PROPERTY(bool training READ training NOTIFY trainingChanged)
   Q_PROPERTY(double learningRate READ learningRate WRITE setLearningRate NOTIFY learningRateChanged)
   Q_PROPERTY(int epoch READ epoch NOTIFY trainingProgress)
@@ -172,6 +174,9 @@ class EngineBridge : public QObject, public synapse::Observer {
   Q_INVOKABLE void saveModel(const QString& path);
   Q_INVOKABLE QString modelJson() const;
   Q_INVOKABLE void setInputDim(int dim);
+  // Switch the input widget ("labels", "grid", or "segments"); rows/cols apply to grid.
+  // Adjusts input_dim to match (grid → rows·cols, segments → 7) and rebuilds.
+  Q_INVOKABLE void setInputLayout(const QString& layout, int rows, int cols);
   Q_INVOKABLE void addLayer(int units, const QString& activation);
   Q_INVOKABLE void removeLayer(int index);
   Q_INVOKABLE void setLayerUnits(int index, int units);

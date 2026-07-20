@@ -16,7 +16,7 @@
   ],
   "io": {
     "input": {
-      "layout": "labels",
+      "layout": "segments",
       "labels": [
         "a",
         "b",

@@ -25,6 +25,7 @@ ApplicationWindow {
 
     readonly property int gridRows: bridge.inputLayout === "grid" ? bridge.inputRows : 1
     readonly property int gridCols: bridge.inputLayout === "grid" ? bridge.inputCols : bridge.inputDim
+    readonly property bool isSegments: bridge.inputLayout === "segments"
     readonly property bool isClass: bridge.outputKind === "class"
 
     function zeros(n) { var a = []; for (var i = 0; i < n; ++i) a.push(0); return a }
@@ -143,8 +144,8 @@ ApplicationWindow {
                 anchors.fill: parent
                 anchors.margins: 10
                 clip: true
-                cellWidth: root.gridCols * 14 + 28
-                cellHeight: root.gridRows * 14 + 52
+                cellWidth: root.isSegments ? 74 : root.gridCols * 14 + 28
+                cellHeight: root.isSegments ? 104 : root.gridRows * 14 + 52
                 model: bridge.datasetSize
 
                 delegate: Item {
@@ -165,12 +166,21 @@ ApplicationWindow {
                             anchors.centerIn: parent
                             spacing: 4
                             PixelGrid {
+                                visible: !root.isSegments
                                 Layout.alignment: Qt.AlignHCenter
                                 interactive: false
                                 rows: root.gridRows
                                 cols: root.gridCols
                                 cell: 12
                                 gap: 1
+                                values: { root.rev; return bridge.exampleInput(card.index) }
+                                onClicked: root.selectExample(card.index)
+                            }
+                            SegmentDisplay {
+                                visible: root.isSegments
+                                Layout.alignment: Qt.AlignHCenter
+                                interactive: false
+                                size: 34
                                 values: { root.rev; return bridge.exampleInput(card.index) }
                                 onClicked: root.selectExample(card.index)
                             }
@@ -242,39 +252,16 @@ ApplicationWindow {
                         Layout.rightMargin: 16
                         title: qsTr("Input")
 
-                        ColumnLayout {
+                        InputWidget {
                             anchors.fill: parent
-                            spacing: 8
-
-                            PixelGrid {
-                                visible: bridge.inputLayout === "grid"
-                                Layout.alignment: Qt.AlignHCenter
-                                interactive: true
-                                rows: root.gridRows
-                                cols: root.gridCols
-                                cell: 30
-                                values: root.editInput
-                                onPainted: (index, value) => root.setEditInput(index, value)
-                            }
-                            Repeater {
-                                model: bridge.inputLayout === "labels" ? bridge.inputDim : 0
-                                delegate: RowLayout {
-                                    id: inRow
-                                    required property int index
-                                    Layout.fillWidth: true
-                                    Label {
-                                        text: (bridge.inputLabels[inRow.index] !== undefined)
-                                              ? bridge.inputLabels[inRow.index] : ("x" + inRow.index)
-                                        color: "#8b949e"; Layout.preferredWidth: 40; elide: Text.ElideRight
-                                    }
-                                    Slider {
-                                        Layout.fillWidth: true
-                                        from: 0; to: 1; stepSize: 0.05
-                                        value: (root.editInput[inRow.index] !== undefined) ? root.editInput[inRow.index] : 0
-                                        onMoved: root.setEditInput(inRow.index, value)
-                                    }
-                                }
-                            }
+                            layout: bridge.inputLayout
+                            rows: root.gridRows
+                            cols: root.gridCols
+                            labels: bridge.inputLabels
+                            dim: bridge.inputDim
+                            values: root.editInput
+                            gridCell: 30
+                            onEdited: (index, value) => root.setEditInput(index, value)
                         }
                     }
 

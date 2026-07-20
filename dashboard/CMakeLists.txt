@@ -22,6 +22,8 @@ qt_add_qml_module(synapse_dashboard
     qml/Main.qml
     qml/NetworkView.qml
     qml/PixelGrid.qml
+    qml/SegmentDisplay.qml
+    qml/InputWidget.qml
     qml/LossChart.qml
     qml/DataManager.qml
     qml/StatsPanel.qml

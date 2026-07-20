@@ -549,6 +549,38 @@ void EngineBridge::setInputDim(int dim) {
   rebuild();
 }
 
+void EngineBridge::setInputLayout(const QString& layout, int rows, int cols) {
+  if (layout == "grid") {
+    m_inputLayout = "grid";
+    m_inputRows = std::max(1, rows);
+    m_inputCols = std::max(1, cols);
+    m_inputLabels.clear();
+    m_topo.input_dim = m_inputRows * m_inputCols;
+  } else if (layout == "segments") {
+    // A fixed seven-segment display: seven inputs, named a–g in standard order.
+    m_inputLayout = "segments";
+    m_inputRows = 1;
+    m_inputCols = 7;
+    m_inputLabels = QVariantList{"a", "b", "c", "d", "e", "f", "g"};
+    m_topo.input_dim = 7;
+  } else {
+    m_inputLayout = "labels";
+    m_inputRows = 1;
+    m_inputCols = 0;
+    // Give every slider a generic name unless the current labels already fit.
+    if (m_inputLabels.size() != m_topo.input_dim) {
+      m_inputLabels.clear();
+      for (int i = 0; i < m_topo.input_dim; ++i)
+        m_inputLabels.push_back(QStringLiteral("x%1").arg(i));
+    }
+  }
+  if (!m_topo.layers.empty()) m_topo.layers.front().input_dim = m_topo.input_dim;
+  emit blueprintChanged();  // the panel swaps to the new input widget
+  rebuild();                // re-inits the net for the new input dimension
+  m_flatDirty = true;
+  if (!m_dataset.empty()) loadExample(0);
+}
+
 void EngineBridge::addLayer(int units, const QString& activation) {
   if (units < 1) units = 1;
   LayerInfo L;
