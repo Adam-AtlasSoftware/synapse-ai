@@ -54,6 +54,39 @@ void apply_activation(Activation a, const float* pre, float* act, int n) {
   }
 }
 
+// Host (CPU) activation — used by the training loop, which runs entirely on the
+// host. For single-sample SGD the per-layer GPU kernel launches (and their waits)
+// cost far more than the arithmetic, so plain CPU loops are dramatically faster;
+// the GPU still powers inference and the gradient-flow animation.
+void apply_activation_host(Activation a, const float* pre, float* act, int n) {
+  switch (a) {
+    case Activation::Linear:
+      for (int i = 0; i < n; ++i) act[i] = pre[i];
+      break;
+    case Activation::Sigmoid:
+      for (int i = 0; i < n; ++i) act[i] = 1.0f / (1.0f + std::exp(-pre[i]));
+      break;
+    case Activation::ReLU:
+      for (int i = 0; i < n; ++i) act[i] = pre[i] > 0.0f ? pre[i] : 0.0f;
+      break;
+    case Activation::Tanh:
+      for (int i = 0; i < n; ++i) act[i] = std::tanh(pre[i]);
+      break;
+    case Activation::Softmax: {
+      float m = pre[0];
+      for (int i = 1; i < n; ++i) m = pre[i] > m ? pre[i] : m;
+      float sum = 0.0f;
+      for (int i = 0; i < n; ++i) {
+        float e = std::exp(pre[i] - m);
+        act[i] = e;
+        sum += e;
+      }
+      for (int i = 0; i < n; ++i) act[i] /= sum;
+      break;
+    }
+  }
+}
+
 }  // namespace
 
 // The derivative of an activation w.r.t. its pre-activation, expressed in terms of
@@ -208,6 +241,27 @@ struct Network::Impl {
     for (int k = 0; k < static_cast<int>(layers.size()); ++k) compute_layer(k);
   }
 
+  // Same math as run_forward, but all on the host (no GPU kernels) — the fast path
+  // the training loop uses. Writes into the same USM buffers so backward() works.
+  void run_forward_host(const std::vector<float>& in) {
+    set_input(in);
+    const float* cur = input.data;
+    for (Layer& L : layers) {
+      const int inN = L.info.input_dim, outN = L.info.output_dim;
+      const float* w = L.W.data;
+      const float* b = L.b.data;
+      float* pre = L.pre.data;
+      for (int o = 0; o < outN; ++o) {
+        const float* wr = w + o * inN;
+        float s = b[o];
+        for (int i = 0; i < inN; ++i) s += wr[i] * cur[i];
+        pre[o] = s;
+      }
+      apply_activation_host(L.info.activation, L.pre.data, L.act.data, outN);
+      cur = L.act.data;
+    }
+  }
+
   // Instant forward pass: compute every layer, emit one snapshot, return output.
   std::vector<float> forward(const std::vector<float>& in) {
     run_forward(in);
@@ -295,7 +349,7 @@ struct Network::Impl {
   }
 
   float train_step(const std::vector<float>& in, const std::vector<float>& target, float lr) {
-    run_forward(in);
+    run_forward_host(in);
     const float l = loss(target);  // loss of the current prediction, before the update
     backward(target);
     apply_gradients(lr);
@@ -303,7 +357,7 @@ struct Network::Impl {
   }
 
   float evaluate_loss(const std::vector<float>& in, const std::vector<float>& target) {
-    run_forward(in);
+    run_forward_host(in);
     return loss(target);
   }
 
@@ -374,15 +428,15 @@ struct Network::Impl {
   // Compare analytic gradients (backprop) to numerical ones (finite differences).
   // Returns the largest relative error over all parameters — tiny means backprop is right.
   double gradient_check(const std::vector<float>& in, const std::vector<float>& target) {
-    run_forward(in);
+    run_forward_host(in);
     backward(target);  // analytic gradients into dW/db
     const float eps = 1e-3f;
     double maxRel = 0.0;
 
     auto check = [&](float* param, float analytic) {
       const float orig = *param;
-      *param = orig + eps; run_forward(in); const float lp = loss(target);
-      *param = orig - eps; run_forward(in); const float lm = loss(target);
+      *param = orig + eps; run_forward_host(in); const float lp = loss(target);
+      *param = orig - eps; run_forward_host(in); const float lm = loss(target);
       *param = orig;
       const double numeric = (lp - lm) / (2.0 * static_cast<double>(eps));
       const double denom = std::abs(numeric) + std::abs(static_cast<double>(analytic)) + 1e-6;
@@ -394,7 +448,7 @@ struct Network::Impl {
       for (int i = 0; i < L.W.size(); ++i) check(&L.W.data[i], L.dW.data[i]);
       for (int i = 0; i < L.b.size(); ++i) check(&L.b.data[i], L.db.data[i]);
     }
-    run_forward(in);  // restore the unperturbed forward state
+    run_forward_host(in);  // restore the unperturbed forward state
     return maxRel;
   }
 

@@ -1,0 +1,70 @@
+{
+  "name": "Full adder",
+  "description": "Binary addition: A + B + carry-in → sum and carry-out. Two labeled outputs (each a bit), a step up from XOR.",
+  "input_dim": 3,
+  "layers": [
+    {
+      "type": "dense",
+      "units": 6,
+      "activation": "tanh"
+    },
+    {
+      "type": "dense",
+      "units": 2,
+      "activation": "sigmoid"
+    }
+  ],
+  "io": {
+    "input": {
+      "layout": "labels",
+      "labels": [
+        "A",
+        "B",
+        "Cin"
+      ],
+      "range": [0, 1]
+    },
+    "output": {
+      "layout": "labels",
+      "labels": [
+        "Sum",
+        "Cout"
+      ],
+      "kind": "value"
+    }
+  },
+  "dataset": [
+    {
+      "input": [0, 0, 0],
+      "target": [0, 0]
+    },
+    {
+      "input": [0, 0, 1],
+      "target": [1, 0]
+    },
+    {
+      "input": [0, 1, 0],
+      "target": [1, 0]
+    },
+    {
+      "input": [0, 1, 1],
+      "target": [0, 1]
+    },
+    {
+      "input": [1, 0, 0],
+      "target": [1, 0]
+    },
+    {
+      "input": [1, 0, 1],
+      "target": [0, 1]
+    },
+    {
+      "input": [1, 1, 0],
+      "target": [0, 1]
+    },
+    {
+      "input": [1, 1, 1],
+      "target": [1, 1]
+    }
+  ]
+}

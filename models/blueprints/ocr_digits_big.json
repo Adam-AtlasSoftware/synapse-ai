@@ -862,7 +862,7 @@
             ]
         }
     ],
-    "description": "Draw a digit into a 5×5 pixel grid (25 inputs) → which digit 0-9 is it (10 outputs)? The flagship: a tiny optical character recognizer.",
+    "description": "A custom blueprint.",
     "input_dim": 25,
     "io": {
         "input": {
@@ -887,8 +887,7 @@
                 "7",
                 "8",
                 "9"
-            ],
-            "layout": "labels"
+            ]
         }
     },
     "layers": [
@@ -896,6 +895,26 @@
             "activation": "relu",
             "type": "dense",
             "units": 16
+        },
+        {
+            "activation": "relu",
+            "type": "dense",
+            "units": 10
+        },
+        {
+            "activation": "relu",
+            "type": "dense",
+            "units": 20
+        },
+        {
+            "activation": "relu",
+            "type": "dense",
+            "units": 25
+        },
+        {
+            "activation": "relu",
+            "type": "dense",
+            "units": 20
         },
         {
             "activation": "relu",
@@ -908,5 +927,5 @@
             "units": 10
         }
     ],
-    "name": "OCR digits (5×5)"
+    "name": "OCR digits (big)"
 }

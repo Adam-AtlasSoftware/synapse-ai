@@ -33,6 +33,10 @@ int main(int argc, char* argv[]) {
   engine.rootContext()->setContextProperty(
       "appTitle", envTitle.isEmpty() ? QStringLiteral("Synapse-AI — Live Network")
                                      : QString::fromUtf8(envTitle));
+  engine.rootContext()->setContextProperty("autoOpenDataManager",
+                                           !qgetenv("SYNAPSE_DATAMANAGER").isEmpty());
+  engine.rootContext()->setContextProperty("grabPath",
+                                           QString::fromUtf8(qgetenv("SYNAPSE_GRAB")));
 
   engine.loadFromModule("SynapseDashboard", "Main");
   if (engine.rootObjects().isEmpty())

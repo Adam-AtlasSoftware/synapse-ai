@@ -1,0 +1,68 @@
+{
+  "dataset": [
+    {
+      "input": [1, 1, 1, 0, 0, 0, 0, 0, 0],
+      "target": [1, 0, 0]
+    },
+    {
+      "input": [0, 0, 0, 1, 1, 1, 0, 0, 0],
+      "target": [1, 0, 0]
+    },
+    {
+      "input": [0, 0, 0, 0, 0, 0, 1, 1, 1],
+      "target": [1, 0, 0]
+    },
+    {
+      "input": [1, 0, 0, 1, 0, 0, 1, 0, 0],
+      "target": [0, 1, 0]
+    },
+    {
+      "input": [0, 1, 0, 0, 1, 0, 0, 1, 0],
+      "target": [0, 1, 0]
+    },
+    {
+      "input": [0, 0, 1, 0, 0, 1, 0, 0, 1],
+      "target": [0, 1, 0]
+    },
+    {
+      "input": [1, 0, 0, 0, 1, 0, 0, 0, 1],
+      "target": [0, 0, 1]
+    },
+    {
+      "input": [0, 0, 1, 0, 1, 0, 1, 0, 0],
+      "target": [0, 0, 1]
+    }
+  ],
+  "description": "Paint a line into a 3×3 grid → is it horizontal, vertical, or diagonal? A small warm-up for the 5×5 OCR grid.",
+  "input_dim": 9,
+  "io": {
+    "input": {
+      "cols": 3,
+      "layout": "grid",
+      "range": [0, 1],
+      "rows": 3
+    },
+    "output": {
+      "kind": "class",
+      "labels": [
+        "Horizontal",
+        "Vertical",
+        "Diagonal"
+      ],
+      "layout": "labels"
+    }
+  },
+  "layers": [
+    {
+      "activation": "relu",
+      "type": "dense",
+      "units": 8
+    },
+    {
+      "activation": "softmax",
+      "type": "dense",
+      "units": 3
+    }
+  ],
+  "name": "Tiny shapes (3×3)"
+}

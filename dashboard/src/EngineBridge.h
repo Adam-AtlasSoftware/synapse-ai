@@ -47,7 +47,7 @@ class EngineBridge : public QObject, public synapse::Observer {
 
   // --- blueprints: template architectures with meaning assigned to I/O ------
   // blueprints: [{name, description, path}] discovered on disk.
-  Q_PROPERTY(QVariantList blueprints READ blueprints CONSTANT)
+  Q_PROPERTY(QVariantList blueprints READ blueprints NOTIFY blueprintsListChanged)
   // input layout: "labels" (named sliders) or "grid" (paintable pixels).
   Q_PROPERTY(QString inputLayout READ inputLayout NOTIFY blueprintChanged)
   Q_PROPERTY(int inputRows READ inputRows NOTIFY blueprintChanged)
@@ -56,6 +56,8 @@ class EngineBridge : public QObject, public synapse::Observer {
   // output: labels per output neuron, and kind = "class" (argmax) or "value".
   Q_PROPERTY(QVariantList outputLabels READ outputLabels NOTIFY blueprintChanged)
   Q_PROPERTY(QString outputKind READ outputKind NOTIFY blueprintChanged)
+  // isBuiltIn: this blueprint ships a pristine default that "Restore default" reverts to.
+  Q_PROPERTY(bool isBuiltIn READ isBuiltIn NOTIFY blueprintChanged)
   // predicted class index/label (argmax of the output column); -1 if none.
   Q_PROPERTY(int predictedIndex READ predictedIndex NOTIFY activationsChanged)
   Q_PROPERTY(QString predictedLabel READ predictedLabel NOTIFY activationsChanged)
@@ -99,6 +101,7 @@ class EngineBridge : public QObject, public synapse::Observer {
   QVariantList inputLabels() const { return m_inputLabels; }
   QVariantList outputLabels() const { return m_outputLabels; }
   QString outputKind() const { return m_outputKind; }
+  bool isBuiltIn() const;
   int predictedIndex() const { return m_predictedIndex; }
   QString predictedLabel() const;
   bool hasDataset() const { return !m_dataset.empty(); }
@@ -148,6 +151,8 @@ class EngineBridge : public QObject, public synapse::Observer {
   // --- blueprints ----------------------------------------------------------
   Q_INVOKABLE void loadBlueprint(const QString& path);       // load a template file
   Q_INVOKABLE bool loadBlueprintByName(const QString& name); // by display name or file stem
+  Q_INVOKABLE void saveBlueprintAs(const QString& name);     // persist current as a new blueprint
+  Q_INVOKABLE void restoreDefault();                         // revert a built-in to its original
 
   // --- training controls ---------------------------------------------------
   Q_INVOKABLE void trainStart();    // run SGD continuously
@@ -175,6 +180,7 @@ class EngineBridge : public QObject, public synapse::Observer {
   void speedChanged();
   void playbackChanged();
   void blueprintChanged();
+  void blueprintsListChanged();
   void trainingChanged();
   void trainingProgress();
   void learningRateChanged();
@@ -231,10 +237,9 @@ class EngineBridge : public QObject, public synapse::Observer {
   QString m_blueprintPath;  // for persisting added examples
   std::mt19937 m_rng{1};
   bool m_training = false;
-  double m_lr = 0.3;
+  double m_lr = 0.1;   // a safe default that converges reliably for both MSE and softmax
   int m_epoch = 0;
   double m_currentLoss = 0.0;
   QVariantList m_lossHistory;
   unsigned m_seed = 42;
-  int m_epochsPerTick = 50;
 };

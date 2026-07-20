@@ -141,6 +141,13 @@ For classifiers, output neurons show their labels and the **predicted class** (a
 ringed in green. A blueprint is just a JSON file (see below), so adding your own is a
 drop-in — and you can still freely edit any blueprint in the Model panel afterward.
 
+**Make your own.** Pick **＋ New blank model** for a clean slate (so tweaking dimensions never
+touches the built-ins), change the layers in the Model panel, add data in the Data manager,
+then **💾 Save as new blueprint…** to persist it under a new name — it appears in the menu.
+Every built-in also has **↺ Restore default**, which reverts it to its shipped architecture
+and data, so you can experiment freely and always get the original back. (Edits to a built-in
+live only in the working copy until you restore — save a copy first if you want to keep them.)
+
 > Predictions are meaningful only **after training** (Phase 4). On an untrained net the
 > "prediction" is the argmax of random weights — hence the *(untrained)* tag next to it.
 
@@ -179,6 +186,10 @@ You can also launch straight into one:
   weight (the chain rule, applied layer by layer), then each weight moves a little downhill.
   That math is verified against finite differences in the test suite (`ctest`).
 - `SYNAPSE_AUTOTRAIN=1 ./build/dashboard/synapse_dashboard` starts training on launch.
+- **Speed**: training runs on the **CPU (host)** — for single-sample SGD that's far faster than
+  launching thousands of tiny GPU kernels, and each training tick is time-bounded so the UI
+  stays responsive on large models. The GPU still powers inference and the gradient-flow
+  animation. (True GPU-accelerated training would come from batching — a future step.)
 
 **Data** — *see what it learns from, and teach it yourself*
 - The **Data** panel browses the training examples (◀ / ▶). **Show this example** loads it into
@@ -190,6 +201,10 @@ You can also launch straight into one:
 - **Manual training** (classifier blueprints): draw/set an input, pick the right **answer**, and
   **+ Add current input** appends it as a new training example. **Save** persists it into the
   blueprint's JSON. Draw a few 7s, add them, and train.
+- **Manage training data…** opens a dedicated window: a gallery of every example (click to
+  edit, ✕ to delete) beside an editor for adding/changing pairs. Built for entering data fast —
+  draw a digit and **press its number key** to label-and-commit in one keystroke; **Enter**
+  commits, **Delete** removes the selected example, **Save to file** writes it all to the JSON.
 
 **Model editor** (Tier-1 editing — no recompile)
 - Change **Input dim**, a layer's **units**, or its **activation**, or **✕**/**＋ Add layer**.

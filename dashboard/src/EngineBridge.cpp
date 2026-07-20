@@ -1,6 +1,7 @@
 #include "EngineBridge.h"
 
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -33,6 +34,15 @@ QVariantList toVariantList(const std::vector<float>& v) {
   out.reserve(static_cast<int>(v.size()));
   for (float x : v) out.push_back(static_cast<double>(x));
   return out;
+}
+
+QString slugify(const QString& name) {
+  QString s;
+  for (QChar c : name.toLower()) {
+    if (c.isLetterOrNumber()) s += c;
+    else if (c == ' ' || c == '-' || c == '_') s += '_';
+  }
+  return s.isEmpty() ? QStringLiteral("model") : s;
 }
 }  // namespace
 
@@ -309,6 +319,41 @@ void EngineBridge::addExample(const QVariantList& in, int labelIndex) {
   emit trainingProgress();  // hasDataset / dataset size shown in the UI
 }
 
+QVariantList EngineBridge::exampleTarget(int i) const {
+  QVariantList out;
+  if (i < 0 || i >= m_dataset.size()) return out;
+  for (float v : m_dataset.samples[i].target) out.push_back(static_cast<double>(v));
+  return out;
+}
+
+void EngineBridge::addExampleRaw(const QVariantList& in, const QVariantList& target) {
+  synapse::Sample s;
+  s.input = toVector(in);
+  s.input.resize(m_topo.input_dim, 0.0f);
+  s.target = toVector(target);
+  s.target.resize(m_topo.output_dim(), 0.0f);
+  m_dataset.samples.push_back(std::move(s));
+  emit datasetChanged();
+  emit trainingProgress();
+}
+
+void EngineBridge::updateExample(int i, const QVariantList& in, const QVariantList& target) {
+  if (i < 0 || i >= m_dataset.size()) return;
+  synapse::Sample& s = m_dataset.samples[i];
+  s.input = toVector(in);
+  s.input.resize(m_topo.input_dim, 0.0f);
+  s.target = toVector(target);
+  s.target.resize(m_topo.output_dim(), 0.0f);
+  emit datasetChanged();
+}
+
+void EngineBridge::removeExample(int i) {
+  if (i < 0 || i >= m_dataset.size()) return;
+  m_dataset.samples.erase(m_dataset.samples.begin() + i);
+  emit datasetChanged();
+  emit trainingProgress();
+}
+
 void EngineBridge::saveDataset() {
   if (m_blueprintPath.isEmpty()) return;
   QFile in(m_blueprintPath);
@@ -557,12 +602,17 @@ void EngineBridge::scanBlueprints() {
     bp["description"] = root.value("description").toString();
     bp["path"] = dir.absoluteFilePath(file);
     bp["inputDim"] = root.value("input_dim").toInt();
+    bp["blank"] = (QFileInfo(file).completeBaseName() == "blank");
     m_blueprints.push_back(bp);
   }
-  // Order the menu by input size, which tracks the ladder of complexity.
+  // Blank first, then by input size (which tracks the ladder of complexity).
   std::sort(m_blueprints.begin(), m_blueprints.end(), [](const QVariant& a, const QVariant& b) {
-    return a.toMap().value("inputDim").toInt() < b.toMap().value("inputDim").toInt();
+    const QVariantMap ma = a.toMap(), mb = b.toMap();
+    if (ma.value("blank").toBool() != mb.value("blank").toBool())
+      return ma.value("blank").toBool();
+    return ma.value("inputDim").toInt() < mb.value("inputDim").toInt();
   });
+  emit blueprintsListChanged();
 }
 
 bool EngineBridge::loadBlueprintByName(const QString& name) {
@@ -639,8 +689,17 @@ void EngineBridge::onTrainTick() {
     trainStop();
     return;
   }
-  float last = 0.0f;
-  for (int e = 0; e < m_epochsPerTick; ++e) last = run_one_epoch();
+  // Run as many epochs as fit in a small time budget, so a tick never stalls the UI:
+  // tiny nets do hundreds of epochs per tick, big nets do a few.
+  QElapsedTimer t;
+  t.start();
+  float last = static_cast<float>(m_currentLoss);
+  int did = 0;
+  do {
+    last = run_one_epoch();
+    ++did;
+  } while (t.elapsed() < 20 && did < 2000);
+
   m_currentLoss = last;
   m_lossHistory.push_back(last);
   if (m_lossHistory.size() > 1000) m_lossHistory.removeFirst();
@@ -683,6 +742,109 @@ void EngineBridge::trainEpoch() {
 void EngineBridge::resetWeights() {
   ++m_seed;   // a fresh random initialization each reset
   rebuild();  // re-inits weights, clears the loss curve, runs a zeros pass
+}
+
+bool EngineBridge::isBuiltIn() const {
+  if (m_blueprintPath.isEmpty()) return false;
+  const QString def = QString::fromUtf8(SYNAPSE_MODELS_DIR) + "/defaults/" +
+                      QFileInfo(m_blueprintPath).fileName();
+  return QFile::exists(def);
+}
+
+// Serialize the current model — architecture, I/O semantics, and dataset — to a new
+// blueprint file, then load it. This is how you keep a custom design without ever
+// touching the built-in blueprints.
+void EngineBridge::saveBlueprintAs(const QString& name) {
+  const QString trimmed = name.trimmed();
+  if (trimmed.isEmpty()) {
+    emit errorOccurred(QStringLiteral("please enter a name"));
+    return;
+  }
+  const QString dir = QString::fromUtf8(SYNAPSE_MODELS_DIR) + "/blueprints";
+  const QString path = dir + "/" + slugify(trimmed) + ".json";
+
+  QJsonObject root;
+  root["name"] = trimmed;
+  root["description"] = QStringLiteral("A custom blueprint.");
+  root["input_dim"] = m_topo.input_dim;
+
+  QJsonArray layers;
+  for (const synapse::LayerInfo& L : m_topo.layers) {
+    QJsonObject lo;
+    lo["type"] = QString::fromStdString(L.type);
+    lo["units"] = L.output_dim;
+    lo["activation"] = QString::fromStdString(synapse::to_string(L.activation));
+    layers.append(lo);
+  }
+  root["layers"] = layers;
+
+  QJsonObject io, in, out;
+  in["layout"] = m_inputLayout;
+  if (m_inputLayout == "grid") {
+    in["rows"] = m_inputRows;
+    in["cols"] = m_inputCols;
+  } else {
+    QJsonArray labs;
+    for (const QVariant& v : m_inputLabels) labs.append(v.toString());
+    in["labels"] = labs;
+  }
+  QJsonArray range;
+  range.append(0);
+  range.append(1);
+  in["range"] = range;
+  QJsonArray outLabels;
+  for (const QVariant& v : m_outputLabels) outLabels.append(v.toString());
+  out["labels"] = outLabels;
+  out["kind"] = m_outputKind;
+  io["input"] = in;
+  io["output"] = out;
+  root["io"] = io;
+
+  QJsonArray ds;
+  for (const synapse::Sample& s : m_dataset.samples) {
+    QJsonArray ji, jt;
+    for (float v : s.input) ji.append(v);
+    for (float v : s.target) jt.append(v);
+    QJsonObject o;
+    o["input"] = ji;
+    o["target"] = jt;
+    ds.append(o);
+  }
+  root["dataset"] = ds;
+
+  QDir().mkpath(dir);
+  QFile f(path);
+  if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+    emit errorOccurred(QStringLiteral("cannot write blueprint: %1").arg(path));
+    return;
+  }
+  f.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+  f.close();
+
+  scanBlueprints();       // the new blueprint appears in the menu
+  loadBlueprint(path);    // and becomes the active model
+}
+
+// Copy the pristine default back over the working file, then reload it.
+void EngineBridge::restoreDefault() {
+  if (!isBuiltIn()) return;
+  const QString def = QString::fromUtf8(SYNAPSE_MODELS_DIR) + "/defaults/" +
+                      QFileInfo(m_blueprintPath).fileName();
+  QFile in(def);
+  if (!in.open(QIODevice::ReadOnly | QIODevice::Text)) {
+    emit errorOccurred(QStringLiteral("cannot read default"));
+    return;
+  }
+  const QByteArray bytes = in.readAll();
+  in.close();
+  QFile out(m_blueprintPath);
+  if (!out.open(QIODevice::WriteOnly | QIODevice::Text)) {
+    emit errorOccurred(QStringLiteral("cannot restore blueprint"));
+    return;
+  }
+  out.write(bytes);
+  out.close();
+  loadBlueprint(m_blueprintPath);
 }
 
 void EngineBridge::loadBlueprint(const QString& path) {

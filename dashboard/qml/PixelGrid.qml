@@ -13,8 +13,10 @@ Item {
     property var values: []       // length rows*cols, read for display
     property real cell: 34
     property real gap: 3
+    property bool interactive: true   // false = read-only thumbnail that emits clicked()
 
     signal painted(int index, real value)
+    signal clicked()
 
     implicitWidth: cols * cell + (cols - 1) * gap
     implicitHeight: rows * cell + (rows - 1) * gap
@@ -65,7 +67,8 @@ Item {
     MouseArea {
         anchors.fill: parent
         acceptedButtons: Qt.LeftButton | Qt.RightButton
-        onPressed: (mouse) => root.paintAt(mouse.x, mouse.y, mouse.buttons)
-        onPositionChanged: (mouse) => root.paintAt(mouse.x, mouse.y, mouse.buttons)
+        onPressed: (mouse) => { if (root.interactive) root.paintAt(mouse.x, mouse.y, mouse.buttons); }
+        onPositionChanged: (mouse) => { if (root.interactive) root.paintAt(mouse.x, mouse.y, mouse.buttons); }
+        onClicked: (mouse) => { if (!root.interactive) root.clicked(); }
     }
 }

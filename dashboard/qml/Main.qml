@@ -38,6 +38,8 @@ ApplicationWindow {
         function onErrorOccurred(message) { errorBar.flash(message) }
     }
 
+    Component.onCompleted: if (autoOpenDataManager) dataManager.show()
+
     RowLayout {
         anchors.fill: parent
         spacing: 0
@@ -356,6 +358,11 @@ ApplicationWindow {
                                 text: qsTr("What the network learns from. Browse the examples, or teach it your own.")
                                 color: "#8b949e"; font.pixelSize: 11; wrapMode: Text.WordWrap
                             }
+                            Button {
+                                Layout.fillWidth: true
+                                text: qsTr("⤢ Manage training data…")
+                                onClicked: dataManager.show()
+                            }
 
                             RowLayout {
                                 Layout.fillWidth: true
@@ -509,6 +516,20 @@ ApplicationWindow {
                                 Layout.fillWidth: true
                                 onClicked: bridge.addLayer(4, "tanh")
                             }
+
+                            Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: "#30363d" }
+
+                            Button {
+                                Layout.fillWidth: true
+                                text: qsTr("💾 Save as new blueprint…")
+                                onClicked: { bpNameField.text = bridge.modelName + " copy"; saveAsDialog.open() }
+                            }
+                            Button {
+                                Layout.fillWidth: true
+                                visible: bridge.isBuiltIn
+                                text: qsTr("↺ Restore default")
+                                onClicked: restoreDialog.open()
+                            }
                         }
                     }
 
@@ -540,6 +561,50 @@ ApplicationWindow {
                     Item { Layout.fillHeight: true }
                 }
             }
+        }
+    }
+
+    // Dedicated training-data manager (a separate window, opened on demand).
+    DataManager { id: dataManager; visible: false }
+
+    // Save the current model as a new blueprint.
+    Dialog {
+        id: saveAsDialog
+        title: qsTr("Save as new blueprint")
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: 360
+        standardButtons: Dialog.Save | Dialog.Cancel
+        onAccepted: bridge.saveBlueprintAs(bpNameField.text)
+        ColumnLayout {
+            anchors.fill: parent
+            spacing: 8
+            Label { text: qsTr("Name for your blueprint:"); color: "#e6edf3" }
+            TextField {
+                id: bpNameField
+                Layout.fillWidth: true
+                placeholderText: qsTr("My model")
+                onAccepted: saveAsDialog.accept()
+            }
+        }
+    }
+
+    // Confirm reverting a built-in blueprint to its shipped default.
+    Dialog {
+        id: restoreDialog
+        title: qsTr("Restore default?")
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: 380
+        standardButtons: Dialog.Yes | Dialog.No
+        onAccepted: bridge.restoreDefault()
+        Label {
+            width: 340
+            wrapMode: Text.WordWrap
+            color: "#e6edf3"
+            text: qsTr("Reset “") + bridge.modelName
+                  + qsTr("” to its original architecture and data? Your changes to this built-in "
+                         + "will be discarded — use “Save as new blueprint” first if you want to keep them.")
         }
     }
 

@@ -1,0 +1,13 @@
+{
+  "name": "＋ New blank model",
+  "description": "A blank canvas. Edit the input size, layers, and activations in the Model panel to design your own network, add data in the Data manager, then Save as a new blueprint.",
+  "input_dim": 3,
+  "layers": [
+    { "type": "dense", "units": 4, "activation": "relu" },
+    { "type": "dense", "units": 2, "activation": "sigmoid" }
+  ],
+  "io": {
+    "input":  { "layout": "labels", "labels": ["x0", "x1", "x2"], "range": [0, 1] },
+    "output": { "layout": "labels", "labels": ["y0", "y1"], "kind": "value" }
+  }
+}
