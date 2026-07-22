@@ -7,6 +7,7 @@
 
 #include "activation_registry.hpp"
 #include "engine_context.hpp"
+#include "optimizer_registry.hpp"
 #include "synapse/model_spec.hpp"
 #include "tensor.hpp"
 
@@ -47,6 +48,10 @@ struct Layer {
   Tensor db;     // 1 x output_dim          (∂loss/∂b)
   Tensor delta;  // 1 x output_dim          (∂loss/∂pre — the backprop signal)
 
+  // Per-parameter optimizer state (state_slots floats each), e.g. momentum's velocity
+  // or Adam's m and v. Plain host memory — the update rule runs on the host.
+  std::vector<float> wState, bState;
+
   // Batched buffers (N x output_dim) for full-batch GPU training. Allocated lazily.
   Tensor bZ;     // pre-activations for the whole batch
   Tensor bA;     // activations for the whole batch
@@ -67,6 +72,11 @@ struct Network::Impl {
   int batch_n = 0;
   Tensor bX;  // batch_n x input_dim
   Tensor bY;  // batch_n x output_dim (last layer)
+
+  // optimizer: the update rule plus its step counter (Adam's bias correction needs it)
+  const OptimizerImpl* opt = nullptr;
+  std::string opt_name = "sgd";
+  int opt_t = 0;
 
   // stepped learn-step (gradient-flow animation) state
   bool learn_on = false;
@@ -115,7 +125,24 @@ struct Network::Impl {
     cursor = static_cast<int>(layers.size());  // "done" until a pass is started
     batch_n = 0;  // force batched buffers to reallocate for the new architecture
     built = true;
+    reset_optimizer_state();  // fresh velocities/moments for the new architecture
     notify_topology();
+  }
+
+  // (Re)allocate and zero each layer's optimizer state for the current rule.
+  void reset_optimizer_state() {
+    opt = &optimizer_by_name(opt_name);
+    opt_t = 0;
+    const int slots = opt->state_slots;
+    for (Layer& L : layers) {
+      L.wState.assign(static_cast<size_t>(L.W.size()) * slots, 0.0f);
+      L.bState.assign(static_cast<size_t>(L.b.size()) * slots, 0.0f);
+    }
+  }
+
+  void set_optimizer(const std::string& name) {
+    opt_name = name;
+    reset_optimizer_state();
   }
 
   void notify_topology() {
@@ -288,10 +315,19 @@ struct Network::Impl {
     compute_gradients();
   }
 
+  // Hand every parameter to the optimizer's update rule. For "sgd" this is exactly the
+  // old `W -= lr * dW`; momentum/Adam additionally read and write their own state slice.
   void apply_gradients(float lr) {
+    if (!opt) reset_optimizer_state();
+    const int slots = opt->state_slots;
+    ++opt_t;
     for (Layer& L : layers) {
-      for (int i = 0; i < L.W.size(); ++i) L.W.data[i] -= lr * L.dW.data[i];
-      for (int i = 0; i < L.b.size(); ++i) L.b.data[i] -= lr * L.db.data[i];
+      for (int i = 0; i < L.W.size(); ++i)
+        opt->update(&L.W.data[i], L.dW.data[i], L.wState.data() + static_cast<size_t>(i) * slots,
+                    lr, opt_t);
+      for (int i = 0; i < L.b.size(); ++i)
+        opt->update(&L.b.data[i], L.db.data[i], L.bState.data() + static_cast<size_t>(i) * slots,
+                    lr, opt_t);
     }
   }
 
@@ -306,6 +342,42 @@ struct Network::Impl {
   float evaluate_loss(const std::vector<float>& in, const std::vector<float>& target) {
     run_forward_host(in);
     return loss(target);
+  }
+
+  // Silent forward — no snapshot emitted, so a whole dataset can be swept for accuracy
+  // without flooding the observer.
+  std::vector<float> predict(const std::vector<float>& in) {
+    run_forward_host(in);
+    const Layer& L = layers.back();
+    return std::vector<float>(L.act.data, L.act.data + L.info.output_dim);
+  }
+
+  // ── parameters: one flat vector, per layer all of W then all of b ──────────
+  int parameter_count() const {
+    int n = 0;
+    for (const Layer& L : layers) n += L.W.size() + L.b.size();
+    return n;
+  }
+
+  std::vector<float> parameters() const {
+    std::vector<float> out;
+    out.reserve(parameter_count());
+    for (const Layer& L : layers) {
+      out.insert(out.end(), L.W.data, L.W.data + L.W.size());
+      out.insert(out.end(), L.b.data, L.b.data + L.b.size());
+    }
+    return out;
+  }
+
+  bool set_parameters(const std::vector<float>& p) {
+    if (static_cast<int>(p.size()) != parameter_count()) return false;  // wrong architecture
+    size_t k = 0;
+    for (Layer& L : layers) {
+      for (int i = 0; i < L.W.size(); ++i) L.W.data[i] = p[k++];
+      for (int i = 0; i < L.b.size(); ++i) L.b.data[i] = p[k++];
+    }
+    reset_optimizer_state();  // old velocities/moments no longer describe these weights
+    return true;
   }
 
   // ── stepped learn-step: one gradient-descent step in slow motion ──
@@ -593,7 +665,14 @@ struct Network::Impl {
       Aprev = layers[k].bA.data;
       ain = layers[k].info.output_dim;
     }
-    update_params_batched(lr);
+    // Device kernels can't call the registry's host update rule, so anything other than
+    // plain SGD finishes the gradients on the GPU and then applies the step on the host.
+    if (opt_name == "sgd") {
+      update_params_batched(lr);
+    } else {
+      queue().wait();  // gradients are in L.dW (USM) — safe to read from the host
+      apply_gradients(lr);
+    }
     queue().wait();  // all epoch kernels finished before the next epoch touches the buffers
     ++step;
     return meanLoss;
@@ -677,6 +756,12 @@ double Network::gradient_check(const std::vector<float>& in, const std::vector<f
 float Network::evaluate_loss(const std::vector<float>& in, const std::vector<float>& target) {
   return impl_->evaluate_loss(in, target);
 }
+std::vector<float> Network::predict(const std::vector<float>& in) { return impl_->predict(in); }
+int Network::parameter_count() const { return impl_->parameter_count(); }
+std::vector<float> Network::parameters() const { return impl_->parameters(); }
+bool Network::set_parameters(const std::vector<float>& p) { return impl_->set_parameters(p); }
+void Network::set_optimizer(const std::string& name) { impl_->set_optimizer(name); }
+std::string Network::optimizer() const { return impl_->opt_name; }
 void Network::begin_learn_step(const std::vector<float>& in, const std::vector<float>& target,
                                float lr) {
   impl_->begin_learn_step(in, target, lr);

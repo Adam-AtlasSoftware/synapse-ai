@@ -32,6 +32,7 @@ find_package(AdaptiveCpp REQUIRED)
 enable_testing()
 
 add_subdirectory(engine)
+add_subdirectory(host)
 add_subdirectory(dashboard)
 add_subdirectory(examples)
 add_subdirectory(tests)

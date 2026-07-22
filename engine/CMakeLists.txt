@@ -6,6 +6,8 @@ set(SYNAPSE_ENGINE_SOURCES
   src/telemetry.cpp
   src/activation_registry.cpp
   src/custom_activations.cpp
+  src/optimizer_registry.cpp
+  src/custom_optimizers.cpp
   src/json.cpp
   src/model_spec.cpp
   src/network.cpp

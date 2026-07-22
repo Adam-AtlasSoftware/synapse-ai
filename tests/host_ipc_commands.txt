@@ -1,0 +1,7 @@
+{"id":1,"cmd":"load","path":"models/blueprints/xor.json"}
+{"id":2,"cmd":"activations"}
+{"id":3,"cmd":"train","lr":0.5,"budget_ms":800,"max_epochs":8000}
+{"id":4,"cmd":"forward","input":[1,0]}
+{"id":5,"cmd":"forward","input":[0,0]}
+{"id":6,"cmd":"bogus_command"}
+{"id":7,"cmd":"quit"}

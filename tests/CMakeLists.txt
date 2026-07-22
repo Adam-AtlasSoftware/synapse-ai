@@ -19,3 +19,23 @@ add_executable(custom_activation_smoke custom_activation_smoke.cpp)
 target_link_libraries(custom_activation_smoke PRIVATE synapse_engine)
 target_include_directories(custom_activation_smoke PRIVATE ${CMAKE_SOURCE_DIR}/engine/src)
 add_test(NAME custom_activation COMMAND custom_activation_smoke)
+
+# Phase 7: pluggable optimizers (sgd/momentum/adam) + parameter save/restore.
+add_executable(optimizer_smoke optimizer_smoke.cpp)
+target_link_libraries(optimizer_smoke PRIVATE synapse_engine)
+add_test(NAME optimizers COMMAND optimizer_smoke)
+
+# Phase 8: the auto-training coach's policy, driven with synthetic loss curves. Plain C++,
+# so it needs the engine only for the Metrics struct — no Qt, no GUI.
+add_executable(auto_trainer_smoke auto_trainer_smoke.cpp ${CMAKE_SOURCE_DIR}/dashboard/src/AutoTrainer.cpp)
+target_include_directories(auto_trainer_smoke PRIVATE ${CMAKE_SOURCE_DIR}/dashboard/src)
+target_link_libraries(auto_trainer_smoke PRIVATE synapse_engine)
+add_test(NAME auto_trainer COMMAND auto_trainer_smoke)
+
+# Phase 6b: the engine running as a SEPARATE PROCESS. Drives synapse_engine_host over
+# pipes and checks it streams the telemetry contract as JSON and trains XOR.
+add_test(NAME engine_host_ipc COMMAND ${CMAKE_COMMAND}
+  -DHOST_EXE=$<TARGET_FILE:synapse_engine_host>
+  -DWORK_DIR=${CMAKE_SOURCE_DIR}
+  -DCOMMANDS=${CMAKE_CURRENT_SOURCE_DIR}/host_ipc_commands.txt
+  -P ${CMAKE_CURRENT_SOURCE_DIR}/host_ipc_test.cmake)

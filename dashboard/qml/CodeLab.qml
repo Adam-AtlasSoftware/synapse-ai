@@ -17,16 +17,25 @@ ApplicationWindow {
     title: qsTr("Code Lab — Custom C++ activations")
     color: "#0d1117"
 
-    // A ready-to-build example: the same file with the "swish" activation enabled.
-    readonly property string swishExample: `#include <cmath>
-
-#include "activation_registry.hpp"
-
-// Custom activation functions — real C++ the engine compiles. Edit, then Rebuild.
-namespace synapse {
-
-void register_custom_activations() {
-  // "swish" (a.k.a. SiLU) = x * sigmoid(x): a smooth, self-gated activation.
+    // Worked, ready-to-compile examples. Every one of these is gradient-checked by
+    // tests/custom_activation_smoke.cpp, so the math you copy here is verified.
+    readonly property var templates: [
+    {
+        name: "leaky_relu",
+        blurb: qsTr("ReLU with a small slope for negatives, so units never fully \"die\". The simplest place to start."),
+        code: `  // "leaky_relu" — ReLU with a small slope for negatives, so units never fully die.
+  register_activation({
+      "leaky_relu", false,
+      [](const float* pre, float* act, int n) {
+        for (int i = 0; i < n; ++i) act[i] = pre[i] > 0.0f ? pre[i] : 0.01f * pre[i];
+      },
+      [](float pre, float post) { return pre > 0.0f ? 1.0f : 0.01f; }});
+`
+    },
+    {
+        name: "swish",
+        blurb: qsTr("x · sigmoid(x) — smooth and self-gating; often trains a little better than ReLU."),
+        code: `  // "swish" (a.k.a. SiLU) = x * sigmoid(x): a smooth, self-gated activation.
   register_activation({
       "swish", false,
       [](const float* pre, float* act, int n) {
@@ -39,10 +48,70 @@ void register_custom_activations() {
         float s = 1.0f / (1.0f + std::exp(-pre));
         return s + pre * s * (1.0f - s);          // sigmoid(x) + x·sigmoid'(x)
       }});
-}
-
-}  // namespace synapse
 `
+    },
+    {
+        name: "elu",
+        blurb: qsTr("Linear above zero, saturating exponential below — keeps mean activations near zero. Shows how to reuse `post` in the derivative."),
+        code: `  // "elu" — linear above zero, saturating exponential below.
+  register_activation({
+      "elu", false,
+      [](const float* pre, float* act, int n) {
+        for (int i = 0; i < n; ++i) act[i] = pre[i] > 0.0f ? pre[i] : (std::exp(pre[i]) - 1.0f);
+      },
+      // For x <= 0 the output is e^x - 1, so the slope is e^x = post + 1.
+      [](float pre, float post) { return pre > 0.0f ? 1.0f : post + 1.0f; }});
+`
+    },
+    {
+        name: "softplus",
+        blurb: qsTr("ln(1 + eˣ), a smooth ReLU. Its derivative is exactly sigmoid(x) — an elegant one to study."),
+        code: `  // "softplus" — ln(1 + e^x), a smooth ReLU. Its derivative is exactly sigmoid(x).
+  register_activation({
+      "softplus", false,
+      [](const float* pre, float* act, int n) {
+        for (int i = 0; i < n; ++i)
+          act[i] = pre[i] > 20.0f ? pre[i] : std::log1p(std::exp(pre[i]));  // guard overflow
+      },
+      [](float pre, float post) { return 1.0f / (1.0f + std::exp(-pre)); }});
+`
+    },
+    {
+        name: "gelu",
+        blurb: qsTr("The activation used in most transformers (tanh approximation). A good example of a longer derivative."),
+        code: `  // "gelu" (tanh approximation) — the activation used in most transformers.
+  register_activation({
+      "gelu", false,
+      [](const float* pre, float* act, int n) {
+        const float c = 0.7978845608f;            // sqrt(2/pi)
+        for (int i = 0; i < n; ++i) {
+          float x = pre[i];
+          float u = c * (x + 0.044715f * x * x * x);
+          act[i] = 0.5f * x * (1.0f + std::tanh(u));
+        }
+      },
+      [](float pre, float post) {
+        const float c = 0.7978845608f;
+        float x = pre;
+        float u = c * (x + 0.044715f * x * x * x);
+        float t = std::tanh(u);
+        float du = c * (1.0f + 0.134145f * x * x);  // d/dx of the inner term
+        return 0.5f * (1.0f + t) + 0.5f * x * (1.0f - t * t) * du;
+      }});
+`
+    },
+    {
+        name: "sine",
+        blurb: qsTr("A periodic activation (SIREN). Surprising and fun — good at fitting smooth, repeating signals."),
+        code: `  // "sine" — a periodic activation (SIREN); good at smooth, repeating signals.
+  register_activation({
+      "sine", false,
+      [](const float* pre, float* act, int n) {
+        for (int i = 0; i < n; ++i) act[i] = std::sin(pre[i]);
+      },
+      [](float pre, float post) { return std::cos(pre); }});
+`
+    }]
 
     onVisibleChanged: if (visible) editor.text = bridge.customActivationSource()
 
@@ -70,6 +139,15 @@ void register_custom_activations() {
             color: "#8b949e"; font.pixelSize: 12; wrapMode: Text.WordWrap
         }
 
+        Label {
+            Layout.fillWidth: true
+            text: bridge.engineKind === "subprocess"
+                  ? qsTr("⚡ Engine: separate process — Rebuild swaps in the new engine live; this window and your session stay open.")
+                  : qsTr("Engine: linked in-process — Rebuild relinks and relaunches the app. Unset SYNAPSE_ENGINE_INPROCESS to hot-swap instead.")
+            color: bridge.engineKind === "subprocess" ? "#3fb950" : "#8b949e"
+            font.pixelSize: 11; wrapMode: Text.WordWrap
+        }
+
         // ── source editor ────────────────────────────────────────────────────
         Label { text: qsTr("engine/src/custom_activations.cpp"); color: "#58a6ff"; font.pixelSize: 12; font.bold: true }
         Frame {
@@ -94,13 +172,23 @@ void register_custom_activations() {
             }
         }
 
+        // ── worked examples ──────────────────────────────────────────────────
         RowLayout {
             Layout.fillWidth: true
             spacing: 8
+            Label { text: qsTr("Examples:"); color: "#8b949e"; font.pixelSize: 12 }
+            ComboBox {
+                id: templatePicker
+                Layout.preferredWidth: 150
+                model: root.templates.map(function (t) { return t.name })
+            }
             Button {
-                text: qsTr("Insert swish example")
+                text: qsTr("＋ Insert at cursor")
                 enabled: !bridge.building
-                onClicked: editor.text = root.swishExample
+                onClicked: {
+                    editor.forceActiveFocus()
+                    editor.insert(editor.cursorPosition, root.templates[templatePicker.currentIndex].code)
+                }
             }
             Button {
                 text: qsTr("Reload from disk")
@@ -123,6 +211,12 @@ void register_custom_activations() {
                     bridge.rebuildEngine()
                 }
             }
+        }
+        Label {
+            Layout.fillWidth: true
+            text: "↳ " + root.templates[templatePicker.currentIndex].blurb
+                  + qsTr("  ·  Insert drops it at your cursor — put that inside register_custom_activations().")
+            color: "#8b949e"; font.pixelSize: 11; wrapMode: Text.WordWrap
         }
 
         // ── build output console ─────────────────────────────────────────────

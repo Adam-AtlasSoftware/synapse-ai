@@ -9,6 +9,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
+#include <QSettings>
 #include <QTextStream>
 #include <algorithm>
 #include <exception>
@@ -29,6 +30,9 @@
 #endif
 #ifndef SYNAPSE_BUILD_DIR
 #define SYNAPSE_BUILD_DIR "build"
+#endif
+#ifndef SYNAPSE_HOST_EXE
+#define SYNAPSE_HOST_EXE "synapse_engine_host"
 #endif
 
 using synapse::LayerInfo;
@@ -60,7 +64,29 @@ EngineBridge::EngineBridge(QObject* parent) : QObject(parent) {
   m_trainTimer.setInterval(50);
   connect(&m_trainTimer, &QTimer::timeout, this, &EngineBridge::onTrainTick);
 
-  m_deviceName = QString::fromStdString(synapse::active_device_name());
+  // The engine runs as its OWN PROCESS by default: a crash in the C++ you're writing in
+  // the Code Lab takes down only the engine, and a rebuild swaps it in without restarting
+  // the app. It speaks the same telemetry contract over pipes, so nothing else changes.
+  //
+  // Measured cost on the largest blueprint (ocr_5x5, 65 examples): ~1030 epochs/s
+  // out-of-process vs ~1265 in-process — the round-trip and JSON snapshot eat into each
+  // tick's fixed 20ms budget. Both converge in a second or two, so it isn't a cost you
+  // can perceive; SYNAPSE_ENGINE_INPROCESS=1 opts out if you want the last 19% anyway.
+  // If the host can't start we fall back to the linked-in engine rather than dying.
+  if (qgetenv("SYNAPSE_ENGINE_INPROCESS").isEmpty()) {
+    auto sub = std::make_unique<SubprocessSession>(QString::fromUtf8(SYNAPSE_HOST_EXE));
+    if (sub->usable()) m_session = std::move(sub);
+  }
+  if (!m_session) m_session = std::make_unique<InProcessSession>();
+  m_session->setObserver(this);  // set before any build so topology reaches us
+
+  // Guidance preferences survive restarts — being told "turn coaching off" and having it
+  // come back next launch would be its own annoyance.
+  QSettings prefs;
+  m_coachingEnabled = prefs.value(QStringLiteral("coachingEnabled"), true).toBool();
+  m_autoTrainEnabled = prefs.value(QStringLiteral("autoTrainEnabled"), true).toBool();
+
+  m_deviceName = m_session->deviceName();
   scanBlueprints();
 
   const QString xorPath = QString::fromUtf8(SYNAPSE_MODELS_DIR) + "/blueprints/xor.json";
@@ -90,15 +116,23 @@ void EngineBridge::rebuild() {
   m_epoch = 0;
   m_currentLoss = 0.0;
   m_lossHistory.clear();
-  m_flatDirty = true;   // output_dim / dataset shape may have changed
+  m_valLossHistory.clear();
   emit trainingProgress();
   try {
-    m_net.build(m_topo, m_seed);  // re-initializes weights
-    m_net.set_observer(this);     // fires on_topology -> refreshes name/columns/layers
-    runForwardZeros();            // populate activations + weights so nothing is blank
+    m_session->build(m_topo, m_seed);  // re-initializes weights, emits topology
+    syncDataset();                     // the engine owns the training loop, so it needs the data
+    m_session->setOptimizer(m_optimizer);
+    m_session->setSplit(static_cast<float>(m_valFraction));
+    runForwardZeros();                 // populate activations + weights so nothing is blank
   } catch (const std::exception& e) {
     emit errorOccurred(QString::fromUtf8(e.what()));
   }
+}
+
+// The engine runs training itself (one call per time budget rather than per sample),
+// so it needs its own copy of the dataset whenever ours changes.
+void EngineBridge::syncDataset() {
+  if (m_session) m_session->setDataset(m_dataset);
 }
 
 // ── synapse::Observer ────────────────────────────────────────────────────────
@@ -228,7 +262,7 @@ void EngineBridge::runForward(const QVariantList& input) {
   }
   m_lastInput = toVector(input);  // remember the current input so training re-runs IT
   try {
-    m_net.forward(m_lastInput);   // instant: emits on_step once
+    m_session->forward(m_lastInput);   // instant: emits on_step once
   } catch (const std::exception& e) {
     emit errorOccurred(QString::fromUtf8(e.what()));
   }
@@ -254,6 +288,7 @@ void EngineBridge::setInput(int index, double value) {
   if (index < 0 || index >= m_topo.input_dim) return;
   m_lastInput[index] = static_cast<float>(value);
   forwardCurrent();
+  noteInputTried();
   emit inputChanged();
 }
 
@@ -268,7 +303,7 @@ void EngineBridge::forwardCurrent() {
   if (static_cast<int>(m_lastInput.size()) != m_topo.input_dim)
     m_lastInput.assign(m_topo.input_dim, 0.0f);
   try {
-    m_net.forward(m_lastInput);
+    m_session->forward(m_lastInput);
   } catch (const std::exception&) {
   }
 }
@@ -284,6 +319,7 @@ void EngineBridge::randomizeInput() {
   for (int i = 0; i < m_topo.input_dim; ++i)
     v.push_back(grid ? (d(m_rng) < 0.35 ? 1.0 : 0.0) : static_cast<double>(d(m_rng)));
   setInputVector(v);
+  noteInputTried();
 }
 
 // ── dataset browsing + manual examples ───────────────────────────────────────
@@ -330,7 +366,7 @@ void EngineBridge::addExample(const QVariantList& in, int labelIndex) {
   s.target.assign(outDim, 0.0f);
   s.target[labelIndex] = 1.0f;
   m_dataset.samples.push_back(std::move(s));
-  m_flatDirty = true;
+  syncDataset();  // engine owns the training loop, keep its copy current
   emit datasetChanged();
   emit trainingProgress();  // hasDataset / dataset size shown in the UI
 }
@@ -349,7 +385,7 @@ void EngineBridge::addExampleRaw(const QVariantList& in, const QVariantList& tar
   s.target = toVector(target);
   s.target.resize(m_topo.output_dim(), 0.0f);
   m_dataset.samples.push_back(std::move(s));
-  m_flatDirty = true;
+  syncDataset();  // engine owns the training loop, keep its copy current
   emit datasetChanged();
   emit trainingProgress();
 }
@@ -361,14 +397,14 @@ void EngineBridge::updateExample(int i, const QVariantList& in, const QVariantLi
   s.input.resize(m_topo.input_dim, 0.0f);
   s.target = toVector(target);
   s.target.resize(m_topo.output_dim(), 0.0f);
-  m_flatDirty = true;
+  syncDataset();  // engine owns the training loop, keep its copy current
   emit datasetChanged();
 }
 
 void EngineBridge::removeExample(int i) {
   if (i < 0 || i >= m_dataset.size()) return;
   m_dataset.samples.erase(m_dataset.samples.begin() + i);
-  m_flatDirty = true;
+  syncDataset();  // engine owns the training loop, keep its copy current
   emit datasetChanged();
   emit trainingProgress();
 }
@@ -423,7 +459,7 @@ void EngineBridge::setSpeedMs(int ms) {
 void EngineBridge::onTick() {
   // Advance one sub-step of whichever animation is running (forward pass or a
   // full learn-step). Stop when it reports there is nothing left to do.
-  const bool more = m_learnMode ? m_net.learn_step_advance() : m_net.step_forward();
+  const bool more = m_learnMode ? m_session->learnAdvance() : m_session->stepForward();
   if (!more) {
     m_timer.stop();
     setPlaying(false);
@@ -443,7 +479,7 @@ void EngineBridge::play(const QVariantList& input) {
   m_learnMode = false;
   m_lastInput = toVector(input);
   try {
-    m_net.begin_forward(m_lastInput);  // reset + show input column
+    m_session->beginForward(m_lastInput);  // reset + show input column
   } catch (const std::exception& e) {
     emit errorOccurred(QString::fromUtf8(e.what()));
     return;
@@ -463,7 +499,7 @@ void EngineBridge::beginForward(const QVariantList& input) {
   m_learnMode = false;
   m_lastInput = toVector(input);
   try {
-    m_net.begin_forward(m_lastInput);
+    m_session->beginForward(m_lastInput);
   } catch (const std::exception& e) {
     emit errorOccurred(QString::fromUtf8(e.what()));
   }
@@ -481,7 +517,7 @@ void EngineBridge::playLearnExample(int i) {
   loadExample(i);  // draw the example into the input
   const synapse::Sample& s = m_dataset.samples[i];
   try {
-    m_net.begin_learn_step(s.input, s.target, static_cast<float>(m_lr));
+    m_session->beginLearn(s.input, s.target, static_cast<float>(m_lr));
   } catch (const std::exception& e) {
     emit errorOccurred(QString::fromUtf8(e.what()));
     return;
@@ -499,12 +535,12 @@ void EngineBridge::stepLearnExample(int i) {
   setTraining(false);
   m_learnMode = true;
   try {
-    if (!m_net.learn_active()) {
+    if (!m_session->learnActive()) {
       loadExample(i);
       const synapse::Sample& s = m_dataset.samples[i];
-      m_net.begin_learn_step(s.input, s.target, static_cast<float>(m_lr));
+      m_session->beginLearn(s.input, s.target, static_cast<float>(m_lr));
     } else {
-      m_net.learn_step_advance();
+      m_session->learnAdvance();
     }
   } catch (const std::exception& e) {
     emit errorOccurred(QString::fromUtf8(e.what()));
@@ -518,10 +554,10 @@ void EngineBridge::stepOnce() {
   if (static_cast<int>(m_lastInput.size()) != m_topo.input_dim)
     m_lastInput.assign(m_topo.input_dim, 0.0f);
   try {
-    if (m_net.forward_done())
-      m_net.begin_forward(m_lastInput);  // finished (or fresh) → reset to input
+    if (m_session->forwardDone())
+      m_session->beginForward(m_lastInput);  // finished (or fresh) → reset to input
     else
-      m_net.step_forward();              // otherwise advance one layer
+      m_session->stepForward();              // otherwise advance one layer
   } catch (const std::exception& e) {
     emit errorOccurred(QString::fromUtf8(e.what()));
   }
@@ -585,7 +621,7 @@ void EngineBridge::setInputLayout(const QString& layout, int rows, int cols) {
   if (!m_topo.layers.empty()) m_topo.layers.front().input_dim = m_topo.input_dim;
   emit blueprintChanged();  // the panel swaps to the new input widget
   rebuild();                // re-inits the net for the new input dimension
-  m_flatDirty = true;
+  syncDataset();  // engine owns the training loop, keep its copy current
   if (!m_dataset.empty()) loadExample(0);
 }
 
@@ -633,6 +669,79 @@ void EngineBridge::setLayerActivation(int index, const QString& activation) {
   rebuild();
 }
 
+// ── trained weights: a sidecar next to the blueprint ─────────────────────────
+// Blueprints stay pure templates (architecture + I/O + data); the weights you trained
+// are their own artifact in models/weights/, so "Restore default" never fights them.
+
+QString EngineBridge::weightsPath() const {
+  if (m_blueprintPath.isEmpty()) return QString();
+  return QString::fromUtf8(SYNAPSE_MODELS_DIR) + "/weights/" +
+         QFileInfo(m_blueprintPath).completeBaseName() + ".json";
+}
+
+bool EngineBridge::hasSavedWeights() const {
+  const QString p = weightsPath();
+  return !p.isEmpty() && QFile::exists(p);
+}
+
+void EngineBridge::saveWeights() {
+  const QString path = weightsPath();
+  if (path.isEmpty()) {
+    emit errorOccurred(QStringLiteral("save the model as a blueprint first"));
+    return;
+  }
+  const std::vector<float> params = m_session->parameters();
+  if (params.empty()) {
+    emit errorOccurred(QStringLiteral("nothing to save"));
+    return;
+  }
+  QJsonArray arr;
+  for (float v : params) arr.append(static_cast<double>(v));
+  QJsonObject root;
+  root["model"] = m_modelName;
+  root["count"] = static_cast<int>(params.size());
+  root["epoch"] = m_epoch;
+  root["params"] = arr;
+
+  QDir().mkpath(QFileInfo(path).absolutePath());
+  QFile f(path);
+  if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+    emit errorOccurred(QStringLiteral("cannot write %1").arg(path));
+    return;
+  }
+  f.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
+  f.close();
+  emit weightsChanged();
+}
+
+void EngineBridge::loadWeights() {
+  const QString path = weightsPath();
+  QFile f(path);
+  if (path.isEmpty() || !f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+    emit errorOccurred(QStringLiteral("no saved weights for this blueprint"));
+    return;
+  }
+  const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
+  f.close();
+
+  std::vector<float> params;
+  for (const QJsonValue& v : root.value("params").toArray())
+    params.push_back(static_cast<float>(v.toDouble()));
+
+  // Guard against weights saved for a different architecture (you edited the layers).
+  if (params.empty() || !m_session->setParameters(params)) {
+    emit errorOccurred(QStringLiteral("saved weights don't fit this architecture — ignoring"));
+    return;
+  }
+  m_epoch = root.value("epoch").toInt();
+  m_lossHistory.clear();
+  m_valLossHistory.clear();
+  forwardCurrent();
+  applyMetrics(m_session->metrics(), false);
+  m_epoch = root.value("epoch").toInt();  // metrics reports the engine's counter (0)
+  emit trainingProgress();
+}
+
 // ── Tier-2 Code Lab: edit engine C++, recompile, relaunch ─────────────────────
 
 QStringList EngineBridge::activationNames() const {
@@ -668,13 +777,65 @@ void EngineBridge::saveCustomActivationSource(const QString& src) {
 // Rebuild the engine (via the dashboard target, which relinks it in) and, on success,
 // relaunch this exact binary re-opening the current blueprint — the "recompile & run"
 // loop. On failure the compiler output stays on screen and the app keeps running.
+bool EngineBridge::usingSubprocess() const {
+  return m_session && m_session->kind() == QLatin1String("subprocess");
+}
+
+// Tear down the engine process and start a freshly-built one, then put it back exactly
+// where we were: same architecture, same dataset, same input. The GUI never restarts —
+// this is what the process boundary bought us.
+void EngineBridge::reloadEngineProcess() {
+  m_timer.stop();
+  m_trainTimer.stop();
+  setPlaying(false);
+  setTraining(false);
+
+  // Keep the training across the swap — same architecture, so the parameters still fit.
+  const std::vector<float> saved = m_session ? m_session->parameters() : std::vector<float>{};
+  const int savedEpoch = m_epoch;
+
+  m_session.reset();  // quits the old engine
+  auto sub = std::make_unique<SubprocessSession>(QString::fromUtf8(SYNAPSE_HOST_EXE));
+  if (!sub->usable()) {
+    m_buildOutput += QStringLiteral("\n✗ The rebuilt engine would not start.\n");
+    emit buildOutputChanged();
+    emit errorOccurred(QStringLiteral("could not restart the engine process"));
+    return;
+  }
+  m_session = std::move(sub);
+  m_session->setObserver(this);
+
+  m_epoch = 0;
+  m_currentLoss = 0.0;
+  m_lossHistory.clear();
+  m_session->build(m_topo, m_seed);  // fresh weights; emits topology
+  syncDataset();
+  m_session->setOptimizer(m_optimizer);
+  m_session->setSplit(static_cast<float>(m_valFraction));
+  if (!saved.empty() && m_session->setParameters(saved)) {
+    m_epoch = savedEpoch;  // the weights really are that trained
+    m_buildOutput += QStringLiteral("✓ Kept your trained weights across the swap.\n");
+  }
+  forwardCurrent();
+
+  emit activationNamesChanged();  // your new activation shows up in the dropdowns
+  emit optimizerNamesChanged();   // ...and any new optimizer too
+  emit trainingProgress();
+}
+
+// Recompile the engine from the C++ you just edited. Out-of-process, only the engine
+// binary needs rebuilding and we hot-swap it. Linked in-process, the engine is part of
+// this executable, so the app has to relink and relaunch itself.
 void EngineBridge::rebuildEngine() {
   if (m_building) return;
   m_building = true;
   emit buildingChanged();
 
+  const bool hotSwap = usingSubprocess();
+  const QString target = hotSwap ? QStringLiteral("synapse_engine_host")
+                                 : QStringLiteral("synapse_dashboard");
   const QString buildDir = QString::fromUtf8(SYNAPSE_BUILD_DIR);
-  m_buildOutput = QStringLiteral("$ cmake --build \"%1\" --target synapse_dashboard\n\n").arg(buildDir);
+  m_buildOutput = QStringLiteral("$ cmake --build \"%1\" --target %2\n\n").arg(buildDir, target);
   emit buildOutputChanged();
 
   QProcess* proc = new QProcess(this);
@@ -683,26 +844,39 @@ void EngineBridge::rebuildEngine() {
     m_buildOutput += QString::fromUtf8(proc->readAllStandardOutput());
     emit buildOutputChanged();
   });
-  connect(proc, &QProcess::finished, this, [this, proc](int code, QProcess::ExitStatus status) {
-    proc->deleteLater();
-    m_building = false;
-    emit buildingChanged();
-    if (code == 0 && status == QProcess::NormalExit) {
-      m_buildOutput += QStringLiteral("\n✓ Build succeeded — relaunching with your new code…\n");
-      emit buildOutputChanged();
-      // Re-open the current blueprint in the new process (env is inherited by the child).
-      if (!m_blueprintPath.isEmpty())
-        qputenv("SYNAPSE_BLUEPRINT", QFileInfo(m_blueprintPath).completeBaseName().toUtf8());
-      QProcess::startDetached(QCoreApplication::applicationFilePath(), QStringList{});
-      QCoreApplication::quit();
-    } else {
-      m_buildOutput += QStringLiteral("\n✗ Build failed (exit %1). Fix the errors above and Rebuild.\n").arg(code);
-      emit buildOutputChanged();
-    }
-  });
+  connect(proc, &QProcess::finished, this,
+          [this, proc, hotSwap](int code, QProcess::ExitStatus status) {
+            proc->deleteLater();
+            m_building = false;
+            emit buildingChanged();
+            if (code != 0 || status != QProcess::NormalExit) {
+              m_buildOutput +=
+                  QStringLiteral("\n✗ Build failed (exit %1). Fix the errors above and Rebuild.\n")
+                      .arg(code);
+              emit buildOutputChanged();
+              return;  // the running engine is untouched — keep working
+            }
+            if (hotSwap) {
+              m_buildOutput += QStringLiteral(
+                  "\n✓ Build succeeded — swapping in the new engine (weights re-initialized)…\n");
+              emit buildOutputChanged();
+              reloadEngineProcess();
+              m_buildOutput += QStringLiteral("✓ Engine reloaded. Your activation is now in the "
+                                              "layer dropdowns — no restart needed.\n");
+              emit buildOutputChanged();
+            } else {
+              m_buildOutput += QStringLiteral("\n✓ Build succeeded — relaunching with your new code…\n");
+              emit buildOutputChanged();
+              // Re-open the current blueprint in the new process (env is inherited).
+              if (!m_blueprintPath.isEmpty())
+                qputenv("SYNAPSE_BLUEPRINT", QFileInfo(m_blueprintPath).completeBaseName().toUtf8());
+              QProcess::startDetached(QCoreApplication::applicationFilePath(), QStringList{});
+              QCoreApplication::quit();
+            }
+          });
   proc->setWorkingDirectory(buildDir);
-  proc->start(QStringLiteral("cmake"), {QStringLiteral("--build"), buildDir,
-                                        QStringLiteral("--target"), QStringLiteral("synapse_dashboard")});
+  proc->start(QStringLiteral("cmake"),
+              {QStringLiteral("--build"), buildDir, QStringLiteral("--target"), target});
 }
 
 // ── blueprints ───────────────────────────────────────────────────────────────
@@ -767,20 +941,28 @@ void EngineBridge::setLearningRate(double lr) {
   emit learningRateChanged();
 }
 
-// One shuffled SGD pass over the dataset. Returns the average loss for the epoch.
-float EngineBridge::run_one_epoch() {
-  const int n = m_dataset.size();
-  if (n == 0) return 0.0f;
-  std::vector<int> order(n);
-  std::iota(order.begin(), order.end(), 0);
-  std::shuffle(order.begin(), order.end(), m_rng);
-  float sum = 0.0f;
-  for (int idx : order) {
-    const synapse::Sample& s = m_dataset.samples[idx];
-    sum += m_net.train_step(s.input, s.target, static_cast<float>(m_lr));
-  }
-  ++m_epoch;
-  return sum / static_cast<float>(n);
+QStringList EngineBridge::optimizerNames() const {
+  return m_session ? const_cast<ModelSession*>(m_session.get())->optimizerNames() : QStringList{};
+}
+
+// Hold out a slice of the data. Training never sees it, so its loss/accuracy show whether
+// the network is genuinely learning the pattern or just memorizing the examples.
+void EngineBridge::setValFraction(double f) {
+  f = std::max(0.0, std::min(f, 0.9));
+  if (qFuzzyCompare(m_valFraction + 1.0, f + 1.0)) return;
+  m_valFraction = f;
+  if (m_session) m_session->setSplit(static_cast<float>(f));
+  m_lossHistory.clear();  // the curves are no longer comparable across a split change
+  m_valLossHistory.clear();
+  emit validationChanged();
+  if (m_session && !m_dataset.empty()) applyMetrics(m_session->metrics(), false);
+}
+
+void EngineBridge::setOptimizer(const QString& name) {
+  if (m_optimizer == name) return;
+  m_optimizer = name;
+  if (m_session) m_session->setOptimizer(name);
+  emit optimizerChanged();
 }
 
 void EngineBridge::setGpuTraining(bool on) {
@@ -789,39 +971,12 @@ void EngineBridge::setGpuTraining(bool on) {
   emit gpuTrainingChanged();
 }
 
-// Flatten the dataset into contiguous input/target arrays for the batched GPU path.
-void EngineBridge::ensureFlatDataset() {
-  if (!m_flatDirty) return;
-  const int inDim = m_topo.input_dim, outDim = m_topo.output_dim();
-  m_flatIn.clear();
-  m_flatOut.clear();
-  m_flatIn.reserve(static_cast<size_t>(m_dataset.size()) * inDim);
-  m_flatOut.reserve(static_cast<size_t>(m_dataset.size()) * outDim);
-  for (const synapse::Sample& s : m_dataset.samples) {
-    for (int i = 0; i < inDim; ++i)
-      m_flatIn.push_back(i < static_cast<int>(s.input.size()) ? s.input[i] : 0.0f);
-    for (int o = 0; o < outDim; ++o)
-      m_flatOut.push_back(o < static_cast<int>(s.target.size()) ? s.target[o] : 0.0f);
-  }
-  m_flatDirty = false;
-}
-
-// One full-batch gradient-descent step on the GPU.
-float EngineBridge::run_one_epoch_gpu() {
-  const int n = m_dataset.size();
-  if (n == 0) return 0.0f;
-  ensureFlatDataset();
-  const float l = m_net.train_epoch_batched(m_flatIn, m_flatOut, n, static_cast<float>(m_lr));
-  ++m_epoch;
-  return l;
-}
-
 // Re-run the forward pass on the input the user is looking at, so the graph and
 // the prediction update live as the weights change during training.
 void EngineBridge::refreshDisplay() {
   if (static_cast<int>(m_lastInput.size()) == m_topo.input_dim && m_topo.input_dim > 0) {
     try {
-      m_net.forward(m_lastInput);
+      m_session->forward(m_lastInput);
     } catch (const std::exception&) {
     }
   }
@@ -831,12 +986,23 @@ void EngineBridge::refreshDisplay() {
 // curve starts at the true peak and shows the whole descent.
 void EngineBridge::seedInitialLoss() {
   if (m_dataset.empty() || !m_lossHistory.isEmpty()) return;
-  float l0 = 0.0f;
-  for (const synapse::Sample& s : m_dataset.samples) l0 += m_net.evaluate_loss(s.input, s.target);
-  l0 /= static_cast<float>(m_dataset.size());
-  m_currentLoss = l0;
-  m_lossHistory.push_back(l0);
-  refreshDisplay();
+  applyMetrics(m_session->metrics(), true);  // the engine scores its own copy of the data
+  refreshDisplay();  // after scoring, so the graph shows the user's input
+}
+
+// Fold a fresh score into the properties the Training panel binds to. `record` also
+// appends to the curves — the two histories stay index-aligned so the chart can draw
+// training and validation on the same x axis.
+void EngineBridge::applyMetrics(const synapse::Metrics& m, bool record) {
+  m_metrics = m;
+  m_epoch = m.epoch;
+  m_currentLoss = static_cast<double>(m.train_loss);
+  if (record) {
+    m_lossHistory.push_back(m_currentLoss);
+    m_valLossHistory.push_back(static_cast<double>(m.val_loss));
+    if (m_lossHistory.size() > 1000) m_lossHistory.removeFirst();
+    if (m_valLossHistory.size() > 1000) m_valLossHistory.removeFirst();
+  }
   emit trainingProgress();
 }
 
@@ -845,22 +1011,12 @@ void EngineBridge::onTrainTick() {
     trainStop();
     return;
   }
-  // Run as many epochs as fit in a small time budget, so a tick never stalls the UI:
-  // tiny nets do hundreds of epochs per tick, big nets do a few.
-  QElapsedTimer t;
-  t.start();
-  float last = static_cast<float>(m_currentLoss);
-  int did = 0;
-  do {
-    last = m_gpuTraining ? run_one_epoch_gpu() : run_one_epoch();
-    ++did;
-  } while (t.elapsed() < 20 && did < 2000);
-
-  m_currentLoss = last;
-  m_lossHistory.push_back(last);
-  if (m_lossHistory.size() > 1000) m_lossHistory.removeFirst();
-  refreshDisplay();
-  emit trainingProgress();
+  // One call runs as many epochs as fit a small time budget, so a tick never stalls the
+  // UI — and, crucially, it is ONE round-trip even when the engine is another process.
+  // The engine also re-runs the current input, so the graph updates as the weights move.
+  applyMetrics(m_session->train(static_cast<float>(m_lr), 20, 2000, m_gpuTraining, m_lastInput),
+               true);
+  if (m_autoTraining) applyAutoAction();
 }
 
 void EngineBridge::trainStart() {
@@ -870,6 +1026,7 @@ void EngineBridge::trainStart() {
   }
   m_timer.stop();  // stop forward playback
   setPlaying(false);
+  resetJourney();  // the old test tally described the previous weights
   seedInitialLoss();
   setTraining(true);
   m_trainTimer.start();
@@ -878,6 +1035,144 @@ void EngineBridge::trainStart() {
 void EngineBridge::trainStop() {
   m_trainTimer.stop();
   setTraining(false);
+  if (m_autoTraining) {
+    m_autoTraining = false;
+    emit autoChanged();
+  }
+}
+
+// Once it has been trained, any hand-edited input is effectively a test of what it
+// learned — so ask the user whether the answer was right.
+void EngineBridge::noteInputTried() {
+  if (m_epoch <= 0 || m_awaitingVerdict) return;
+  m_awaitingVerdict = true;
+  emit journeyChanged();
+}
+
+void EngineBridge::recordTest(bool correct) {
+  if (correct) ++m_testsPassed;
+  else ++m_testsFailed;
+  m_awaitingVerdict = false;
+  emit journeyChanged();
+}
+
+void EngineBridge::resetJourney() {
+  m_awaitingVerdict = false;
+  m_testsPassed = 0;
+  m_testsFailed = 0;
+  emit journeyChanged();
+}
+
+// ── the coach ────────────────────────────────────────────────────────────────
+
+void EngineBridge::autoTrainStart() {
+  if (m_dataset.empty()) {
+    emit errorOccurred(QStringLiteral("teach it at least one example first"));
+    return;
+  }
+  m_autoLog.clear();
+  m_bestParams.clear();
+  m_autoOutcome.clear();
+
+  // Without held-out data there is no way to notice memorizing, so set some aside —
+  // but not on a handful of examples, where holding any back would just starve it.
+  if (m_dataset.size() >= 10 && !validationOn()) {
+    setValFraction(0.2);
+    m_autoLog.push_back(QStringLiteral(
+        "Set aside 20% of your examples so I can tell real learning from memorizing."));
+  }
+
+  m_auto.begin(static_cast<float>(m_lr), validationOn(), m_outputKind == "class");
+  trainStart();  // starts the timer; only trainStop() clears the auto flag
+  m_autoTraining = true;
+  m_autoStatus = tr("Starting…");
+  emit autoChanged();
+}
+
+void EngineBridge::autoTrainStop() {
+  if (!m_bestParams.empty()) m_session->setParameters(m_bestParams);
+  trainStop();
+  applyMetrics(m_session->metrics(), false);
+  refreshDisplay();  // last, so the graph ends up showing the user's input
+}
+
+void EngineBridge::setCoachingEnabled(bool on) {
+  if (m_coachingEnabled == on) return;
+  m_coachingEnabled = on;
+  QSettings().setValue(QStringLiteral("coachingEnabled"), on);
+  emit guidanceChanged();
+}
+
+void EngineBridge::setAutoTrainEnabled(bool on) {
+  if (m_autoTrainEnabled == on) return;
+  m_autoTrainEnabled = on;
+  QSettings().setValue(QStringLiteral("autoTrainEnabled"), on);
+  emit guidanceChanged();
+}
+
+// "Give it more capacity" — the usual fix when a network stalls well short of the mark
+// because it is simply too small to represent the pattern.
+void EngineBridge::growNetwork() {
+  if (m_topo.layers.empty()) return;
+  const int n = static_cast<int>(m_topo.layers.size());
+  if (n == 1) {
+    // No hidden layer at all: give it one.
+    synapse::LayerInfo h;
+    h.type = "dense";
+    h.output_dim = std::max(6, m_topo.input_dim);
+    h.activation = "relu";
+    m_topo.layers.insert(m_topo.layers.begin(), h);
+  } else {
+    for (int k = 0; k < n - 1; ++k)
+      m_topo.layers[k].output_dim = std::min(128, m_topo.layers[k].output_dim * 2);
+  }
+  // Re-chain dimensions and names so the topology stays consistent.
+  int prev = m_topo.input_dim;
+  for (int k = 0; k < static_cast<int>(m_topo.layers.size()); ++k) {
+    m_topo.layers[k].input_dim = prev;
+    m_topo.layers[k].name = "L" + std::to_string(k);
+    prev = m_topo.layers[k].output_dim;
+  }
+  rebuild();  // a different architecture means starting the learning over
+}
+
+// Feed the latest numbers to the coach and carry out whatever it decided.
+void EngineBridge::applyAutoAction() {
+  const AutoTrainer::Action a = m_auto.step(m_metrics);
+
+  if (a.isBest) m_bestParams = m_session->parameters();
+
+  switch (a.kind) {
+    case AutoTrainer::Action::LowerLr:
+      setLearningRate(static_cast<double>(a.lr));
+      break;
+    case AutoTrainer::Action::Rewind:
+      if (!m_bestParams.empty()) m_session->setParameters(m_bestParams);
+      setLearningRate(static_cast<double>(a.lr));
+      break;
+    case AutoTrainer::Action::Stop:
+      switch (m_auto.outcome()) {
+        case AutoTrainer::Outcome::Converged: m_autoOutcome = QStringLiteral("converged"); break;
+        case AutoTrainer::Outcome::Stalled:   m_autoOutcome = QStringLiteral("stalled"); break;
+        case AutoTrainer::Outcome::Overfit:   m_autoOutcome = QStringLiteral("overfit"); break;
+        case AutoTrainer::Outcome::Diverged:  m_autoOutcome = QStringLiteral("diverged"); break;
+        case AutoTrainer::Outcome::None:      m_autoOutcome.clear(); break;
+      }
+      if (!m_bestParams.empty()) m_session->setParameters(m_bestParams);
+      trainStop();
+      applyMetrics(m_session->metrics(), false);
+      refreshDisplay();  // last, so the graph ends up showing the user's input
+      break;
+    case AutoTrainer::Action::Continue:
+      break;
+  }
+
+  if (!a.message.empty()) {
+    m_autoStatus = QString::fromStdString(a.message);
+    m_autoLog.push_back(m_autoStatus);
+    if (m_autoLog.size() > 20) m_autoLog.removeFirst();
+    emit autoChanged();
+  }
 }
 
 void EngineBridge::trainEpoch() {
@@ -888,11 +1183,8 @@ void EngineBridge::trainEpoch() {
   m_timer.stop();
   setPlaying(false);
   seedInitialLoss();
-  m_currentLoss = m_gpuTraining ? run_one_epoch_gpu() : run_one_epoch();
-  m_lossHistory.push_back(m_currentLoss);
-  if (m_lossHistory.size() > 1000) m_lossHistory.removeFirst();
-  refreshDisplay();
-  emit trainingProgress();
+  // budget 0 → exactly one epoch (the loop always runs once).
+  applyMetrics(m_session->train(static_cast<float>(m_lr), 0, 1, m_gpuTraining, m_lastInput), true);
 }
 
 void EngineBridge::resetWeights() {
@@ -1049,11 +1341,16 @@ void EngineBridge::loadBlueprint(const QString& path) {
   m_seed = 42;  // deterministic fresh start per blueprint
 
   emit blueprintChanged();
-  m_flatDirty = true;
+  syncDataset();  // engine owns the training loop, keep its copy current
   emit datasetChanged();
   rebuild();  // build the net + run a zeros pass (emits topology + activations)
 
   // Show a real training example on load instead of a blank input — the graph is
   // meaningful immediately, and training then visibly changes it.
   if (!m_dataset.empty()) loadExample(0);
+
+  // If this blueprint has trained weights saved alongside it, pick up where you left off.
+  resetJourney();
+  emit weightsChanged();
+  if (hasSavedWeights()) loadWeights();
 }

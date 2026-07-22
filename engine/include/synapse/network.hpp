@@ -61,6 +61,24 @@ class Network {
   // Forward + loss without changing weights or emitting telemetry (for eval/plots).
   float evaluate_loss(const std::vector<float>& input, const std::vector<float>& target);
 
+  // Silent forward: returns the output WITHOUT emitting telemetry. Used to sweep a whole
+  // dataset for accuracy without flooding the GUI with snapshots.
+  std::vector<float> predict(const std::vector<float>& input);
+
+  // --- parameters (so training can be saved, restored, and survive a hot-swap) ------
+  // One flat vector: for each layer in order, all of W then all of b. set_parameters
+  // returns false (and changes nothing) if the count doesn't match this architecture.
+  int parameter_count() const;
+  std::vector<float> parameters() const;
+  bool set_parameters(const std::vector<float>& params);
+
+  // --- optimizer -------------------------------------------------------------------
+  // How a weight moves once backprop knows which way is downhill: "sgd" (default),
+  // "momentum", "adam", or anything registered in custom_optimizers.cpp. Changing it
+  // resets the optimizer's internal state (velocities/moments).
+  void set_optimizer(const std::string& name);
+  std::string optimizer() const;
+
   // Stepped learn-step (gradient-flow animation): animate ONE SGD step in slow
   // motion — forward, then loss, then backprop layer by layer, then the weight
   // update. Emits snapshots with phases "begin"/"step"/"loss"/"backward"/"update"

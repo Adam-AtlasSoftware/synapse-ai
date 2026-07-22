@@ -62,12 +62,22 @@ synapse-ai/
   CMakeLists.txt          top-level build
   CMakePresets.json       the "default" preset: Clang + Ninja + AdaptiveCpp + Qt
   engine/
-    include/synapse/      PUBLIC headers — pure C++ (telemetry, network, model_spec)
-    src/                  SYCL kernels + logic (tensor, layers, forward pass, JSON)
+    include/synapse/      PUBLIC headers — pure C++ (telemetry, network, model_spec,
+                          activation, optimizer, metrics)
+    src/                  SYCL kernels + logic; the registries and the two files you
+                          edit from the GUI: custom_activations.cpp, custom_optimizers.cpp
+  host/                   synapse_engine_host — the engine as its own process, speaking
+                          the telemetry contract as JSON over stdin/stdout
   dashboard/
-    src/                  main.cpp + EngineBridge (C++ ↔ QML)
-    qml/                  Main.qml, NetworkView.qml
-  models/                 JSON model specs the dashboard reads/writes (xor.json)
+    src/                  main.cpp, EngineBridge (C++ ↔ QML), ModelSession (in-process
+                          vs subprocess engine behind one interface)
+    qml/                  Main.qml, NetworkView.qml, InputWidget/PixelGrid/SegmentDisplay,
+                          LossChart, StatsPanel, DataManager, CodeLab
+  models/
+    blueprints/           the models you load (architecture + I/O meaning + dataset)
+    defaults/             pristine copies for "Restore default"
+    weights/              trained weights, saved beside their blueprint
+  res/                    brand artwork (app icon, marks) compiled into the binary
   examples/               the original SYCL sandbox files, still buildable
   tests/                  headless engine tests (run via ctest)
 ```
@@ -103,6 +113,22 @@ Then:
 ./build/dashboard/synapse_dashboard    # the visual dashboard
 ctest --test-dir build                 # run the headless engine tests
 ./build/examples/matrix_gpu            # the original SYCL sandbox
+```
+
+**The engine runs as its own process.** The dashboard launches `synapse_engine_host` and
+talks to it over pipes, so a crash in C++ you wrote in the Code Lab takes down only the
+engine, and rebuilding swaps it in without restarting the app. It costs about 19% of
+training throughput (~1030 vs ~1265 epochs/s on the 65-example OCR set) — imperceptible,
+since both converge in a second or two. Set `SYNAPSE_ENGINE_INPROCESS=1` to link the
+engine in directly instead. If the host binary can't start, it falls back automatically.
+
+You can drive the engine yourself — it is just newline-delimited JSON:
+
+```bash
+printf '%s\n' '{"id":1,"cmd":"load","path":"models/blueprints/xor.json"}' \
+               '{"id":2,"cmd":"train","lr":0.5,"budget_ms":300}' \
+               '{"id":3,"cmd":"forward","input":[1,0]}' \
+               '{"id":4,"cmd":"quit"}' | ./build/host/synapse_engine_host
 ```
 
 In **VS Code**, the CMake Tools extension picks up `CMakePresets.json` automatically —
@@ -168,9 +194,13 @@ You can also launch straight into one:
   = larger magnitude.
 - **Columns** are laid out straight from the model's dimensions — the leftmost is your input.
 
-**Inputs** (right panel)
-- Drag the `x0, x1, …` sliders to set an input vector.
-- **Run (instant)** does a full forward pass immediately. **Zeros** / **Rand** set the inputs.
+**Inputs** (right panel) — *the input widget matches the blueprint*
+- Three input methods, chosen per blueprint and switchable in the Model tab:
+  **Sliders** (named values), **Pixel grid** (paint the pixels — OCR, shapes), and
+  **7-segment** (click segments on a real calculator-style display).
+- **Run (instant)** does a full forward pass immediately. **Clear** / **Rand** set the inputs.
+- Making your own model? Pick the input method in the **Model** tab and the grid size with
+  it — the network's input dimension follows automatically (grid → rows×cols, 7-segment → 7).
 
 **Playback** — *watch it happen one step at a time*
 - **▶ Play** resets to the input, then propagates through the network **one layer per tick**.
@@ -189,6 +219,22 @@ You can also launch straight into one:
   re-randomizes the weights to start over.
 - The **learn rate** slider sets how big each gradient step is — too small crawls, too large
   diverges. Try it and watch the curve.
+- **Optimizer** picks *how* each weight moves once backprop knows the direction:
+  **sgd** steps straight downhill; **momentum** keeps a velocity so consistent directions
+  accelerate; **adam** gives every weight its own adaptive step size. On a fixed budget the
+  difference is stark — in the test suite, 150 epochs give sgd `0.0067`, momentum `0.00033`,
+  adam `0.00015`. (Adam adapts its own scale, so pair it with a smaller learn rate, ≈0.02.)
+- **Hold out** reserves a slice of the data that training never sees — the only way to tell
+  *learning* from *memorizing*. Turn it on and the loss chart draws a second **amber
+  validation curve** beside the blue training one, and for classifiers you get
+  **train vs held-out accuracy**. On the 10-digit seven-segment set, holding out 30% gives
+  the classic picture: training loss → 0 and 100% train accuracy, while validation loss
+  *climbs* and held-out accuracy sits at 0% — it memorized the 7 digits it saw and never
+  learned the idea. That is overfitting, and now you can watch it happen.
+- **💾 Save trained weights** keeps the training. Weights go to
+  `models/weights/<blueprint>.json` — a sidecar, so blueprints stay clean templates and
+  **Restore default** never fights them. They reload automatically next time you open that
+  blueprint (and survive an engine hot-swap), so a trained model is a thing you keep.
 - Under the hood: **backpropagation** computes the gradient of the loss with respect to every
   weight (the chain rule, applied layer by layer), then each weight moves a little downhill.
   That math is verified against finite differences in the test suite (`ctest`).
@@ -216,9 +262,28 @@ You can also launch straight into one:
   commits, **Delete** removes the selected example, **Save to file** writes it all to the JSON.
 
 **Model editor** (Tier-1 editing — no recompile)
-- Change **Input dim**, a layer's **units**, or its **activation**, or **✕**/**＋ Add layer**.
-  Every edit rebuilds the network and the graph re-lays-out itself. (Weights re-initialize on
-  a structural change, which also clears the loss curve.)
+- Change the **input method**, a layer's **units**, or its **activation**, or **✕**/**＋ Add
+  layer**. Every edit rebuilds the network and the graph re-lays-out itself. (Weights
+  re-initialize on a structural change, which also clears the loss curve.)
+
+**Code Lab** (Tier-2 editing — *write new math in C++*)
+
+This is the part the whole design was built for: when config isn't enough, you write real
+C++ and the app recompiles the engine around it.
+
+- **Model tab → ⚙ Custom C++ (activations)…** opens an editor on a real engine source file,
+  `engine/src/custom_activations.cpp`.
+- An activation is two small functions: `forward(pre, act, n)` and `derivative(pre, post)`.
+  Pick one of six worked **examples** — `leaky_relu`, `swish`, `elu`, `softplus`, `gelu`,
+  `sine` — and **＋ Insert at cursor**. Every one is gradient-checked in the test suite, so
+  the math you copy is verified.
+- **⚙ Rebuild & Apply** compiles it. The build log streams into the window; compiler errors
+  land there and the running engine is untouched, so you just fix and rebuild. On success the
+  new engine is **swapped in live** — your session, your data, and your trained weights stay
+  put — and your activation appears in every layer's activation dropdown.
+- Optimizers are pluggable the same way: `engine/src/custom_optimizers.cpp` takes a name, how
+  many floats of per-parameter state you need (0 for SGD, 1 for a velocity, 2 for Adam's
+  moments), and the update rule. There's a commented `rmsprop` to start from.
 
 ---
 
@@ -244,11 +309,12 @@ automatically. `models/blueprints/xor.json`:
 ```
 
 - **Architecture** (`input_dim`, `layers`) is read by the *engine*. Each layer's input size
-  is inferred from the previous layer. Activations: `linear`, `sigmoid`, `relu`, `tanh`,
-  `softmax`.
+  is inferred from the previous layer. Built-in activations: `linear`, `sigmoid`, `relu`,
+  `tanh`, `softmax` — plus **any activation you wrote** in the Code Lab, referenced by name.
 - **`io`** is read only by the *dashboard* (the engine ignores it) and assigns meaning:
-  - `input.layout`: `"labels"` (named sliders, with a `labels` array) or `"grid"` (a
-    paintable canvas, with `rows`/`cols`).
+  - `input.layout`: `"labels"` (named sliders, with a `labels` array), `"grid"` (a paintable
+    canvas, with `rows`/`cols`), or `"segments"` (a clickable seven-segment display; the 7
+    inputs are the segments a–g in the standard order).
   - `output.labels`: a name per output neuron. `output.kind`: `"class"` highlights the
     argmax as a prediction; `"value"` just shows the numbers.
 
@@ -263,10 +329,12 @@ The code is built up in the same order the concepts build on each other:
 1. **Tensors** — blocks of numbers on the GPU (`engine/src/tensor.hpp`).
 2. **A dense layer** — `output = activation(W · input + b)` (`engine/src/network.cpp`).
 3. **Activations** — the non-linearities that let a network learn curves, not just lines.
-4. **A forward pass** — stacking layers to turn an input into a prediction. *(you are here)*
-5. **Loss** — measuring how wrong the prediction is. *(next)*
+4. **A forward pass** — stacking layers to turn an input into a prediction.
+5. **Loss** — measuring how wrong the prediction is (MSE, or cross-entropy for softmax).
 6. **Backpropagation** — the chain rule computing how each weight affected the error.
 7. **An optimizer** — nudging weights down the gradient. Repeat = learning.
+8. **Generalization** — holding data back to find out whether it learned the pattern or
+   just memorized the answers. *(this is where the interesting questions start)*
 
 ---
 
@@ -283,11 +351,46 @@ The code is built up in the same order the concepts build on each other:
       control, a **dataset for every blueprint**, **dataset browsing + draw-your-own
       examples**, and a **gradient-flow animation** — watch one SGD step in slow motion
       (forward → loss → backprop layer-by-layer → weight update).
-- [~] **Phase 5** (in progress) — beginner vs advanced views: an **Advanced** toggle (header)
-      reveals a **Layer stats** panel with per-layer activation/weight/gradient μ·σ and live
-      **weight histograms**; beginner mode adds plain-language captions. (More annotations and
-      activation histograms to come.)
-- [ ] **Phase 6** — GUI-driven C++ recompile (Tier-2), engine as a separate process over IPC
+- [x] **Phase 5** — beginner vs advanced views: an **Advanced** toggle reveals per-layer
+      activation/weight/gradient μ·σ with live **weight and activation histograms**; a
+      **click-any-neuron inspector** breaks down `value = activation(bias + Σ inputs×weights)`;
+      stepping is narrated in plain language.
+- [x] **Phase 6** — the full "edit code in the GUI, recompile, run" end-state:
+      **Tier-2 Code Lab** (write a custom activation in real C++, rebuild, use it) and the
+      **engine as a separate process** streaming the telemetry contract as JSON over pipes,
+      so a rebuild hot-swaps the engine without restarting the app.
+- [x] **Phase 7** — keep what you train and find out if it generalizes: **pluggable
+      optimizers** (sgd/momentum/adam, and write your own), an **opt-in validation split**
+      with train-vs-held-out **accuracy** and a dual loss curve that makes **overfitting**
+      visible, and **trained-weight persistence** that survives reloads and hot-swaps.
+
+### Env hooks (handy for demos and screenshots)
+
+| Variable | Effect |
+|---|---|
+| `SYNAPSE_BLUEPRINT=ocr_5x5` | launch straight into a blueprint |
+| `SYNAPSE_ENGINE_INPROCESS=1` | link the engine in instead of running it as a process |
+| `SYNAPSE_AUTOTRAIN=1` | start training immediately |
+| `SYNAPSE_HOLDOUT=0.3` | hold out 30% for validation at launch |
+| `SYNAPSE_OPTIMIZER=adam` | pick the update rule at launch |
+| `SYNAPSE_TAB=1` | open a tab (0 Run, 1 Train, 2 Model, 3 Info) |
+| `SYNAPSE_ADVANCED=1` | start in the advanced view |
+| `SYNAPSE_CODELAB=1` / `SYNAPSE_DATAMANAGER=1` | open a tool window at launch |
+| `SYNAPSE_SELECT="1,3"` | pre-select a neuron in the inspector |
+| `SYNAPSE_LEARNSTEP=N` | advance the gradient-flow animation N sub-steps |
+| `SYNAPSE_SAVEWEIGHTS=1` | write the weights sidecar shortly after launch |
+| `SYNAPSE_GRAB=out.png` | render the window to a PNG and quit |
+
+### What the tests cover (`ctest --test-dir build`)
+
+| Test | Proves |
+|---|---|
+| `forward_smoke` | builds any JSON net and runs inference; public headers stay SYCL-free |
+| `train_xor` / `train_classifier` | backprop matches finite differences, and the net learns (sigmoid+MSE and softmax+cross-entropy) |
+| `train_gpu_batched` | the full-batch GPU training path agrees with the CPU one |
+| `custom_activation` | all six Code Lab activation templates are gradient-correct and train |
+| `optimizers` | sgd/momentum/adam all train, don't disturb backprop, and parameters round-trip exactly |
+| `engine_host_ipc` | the engine works as a separate process: streams telemetry, trains XOR, survives a bad command |
 
 ---
 
@@ -298,3 +401,9 @@ The code is built up in the same order the concepts build on each other:
   the whole file, so hand-edit the QML directly and don't open `Main.qml` in the designer.
 - **First run is slow / "JIT-compiled" warning** — AdaptiveCpp's `generic` target compiles
   kernels on first use; subsequent runs are cached and faster.
+- **"Rebuild & Apply" fails to compile** — that's just your C++; the errors are in the Code
+  Lab's build log and the running engine is untouched. Fix and rebuild.
+- **Saved weights don't load** — they're rejected when the architecture changed (the
+  parameter count no longer matches). Retrain and save again.
+- **Training feels slower than you remember** — the engine now runs out-of-process by
+  default (~19% fewer epochs/sec). `SYNAPSE_ENGINE_INPROCESS=1` gets it back.

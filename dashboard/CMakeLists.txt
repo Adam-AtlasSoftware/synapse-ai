@@ -13,13 +13,31 @@ qt_add_executable(synapse_dashboard
   src/main.cpp
   src/EngineBridge.cpp
   src/EngineBridge.h
+  src/ModelSession.cpp
+  src/ModelSession.h
+  src/AutoTrainer.cpp
+  src/AutoTrainer.h
 )
+
+# Theme is a QML singleton (pragma Singleton); it must be declared as one here too or the
+# generated qmldir won't match and the import fails.
+set_source_files_properties(qml/Theme.qml PROPERTIES QT_QML_SINGLETON_TYPE TRUE)
 
 qt_add_qml_module(synapse_dashboard
   URI SynapseDashboard
   VERSION 1.0
   QML_FILES
+    # design system
+    qml/Theme.qml
+    qml/Card.qml
+    qml/PrimaryButton.qml
+    qml/SecondaryButton.qml
+    qml/Disclosure.qml
+    qml/CoachLine.qml
+    qml/InfoTip.qml
+    # app
     qml/Main.qml
+    qml/WorkflowPanel.qml
     qml/NetworkView.qml
     qml/PixelGrid.qml
     qml/SegmentDisplay.qml
@@ -56,7 +74,10 @@ target_compile_definitions(synapse_dashboard PRIVATE
   SYNAPSE_MODELS_DIR="${CMAKE_SOURCE_DIR}/models"
   SYNAPSE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
   SYNAPSE_BUILD_DIR="${CMAKE_BINARY_DIR}"
+  # Where the out-of-process engine lives, for SYNAPSE_ENGINE_PROCESS=1.
+  SYNAPSE_HOST_EXE="$<TARGET_FILE:synapse_engine_host>"
 )
+add_dependencies(synapse_dashboard synapse_engine_host)
 
 target_link_libraries(synapse_dashboard PRIVATE
   synapse_engine

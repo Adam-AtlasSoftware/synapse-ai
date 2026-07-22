@@ -6,6 +6,8 @@
 #include <random>
 #include <vector>
 
+#include "AutoTrainer.h"
+#include "ModelSession.h"
 #include "synapse/activation.hpp"
 #include "synapse/model_spec.hpp"
 #include "synapse/network.hpp"
@@ -30,12 +32,17 @@ class EngineBridge : public QObject, public synapse::Observer {
   Q_PROPERTY(QVariantList columns READ columns NOTIFY topologyChanged)
   // layers: [{index, units, activation, name}] — the editable dense layers only.
   Q_PROPERTY(QVariantList layers READ layers NOTIFY topologyChanged)
-  // activationNames: every activation the engine knows (built-ins + custom C++), for
-  // the layer dropdowns. CONSTANT within a run — new custom ones appear after a rebuild.
-  Q_PROPERTY(QStringList activationNames READ activationNames CONSTANT)
-  // --- Tier-2 "Code Lab": edit the engine's C++, recompile, relaunch --------
+  // activationNames: every activation the engine knows (built-ins + custom C++), for the
+  // layer dropdowns. NOT constant: when the engine runs out-of-process a rebuild swaps in
+  // a new engine live, and any activation you just wrote appears without restarting.
+  Q_PROPERTY(QStringList activationNames READ activationNames NOTIFY activationNamesChanged)
+  // --- Tier-2 "Code Lab": edit the engine's C++, recompile, apply ----------
   Q_PROPERTY(QString buildOutput READ buildOutput NOTIFY buildOutputChanged)
   Q_PROPERTY(bool building READ building NOTIFY buildingChanged)
+  // "in-process" or "subprocess" — decides whether a rebuild can hot-swap the engine.
+  Q_PROPERTY(QString engineKind READ engineKind CONSTANT)
+  // Is there a saved set of trained weights for the current blueprint?
+  Q_PROPERTY(bool hasSavedWeights READ hasSavedWeights NOTIFY weightsChanged)
   // activations: [[...], [...], ...] aligned with columns (current forward pass).
   Q_PROPERTY(QVariantList activations READ activations NOTIFY activationsChanged)
   // weights: [{rows, cols, values}] — one per layer, for drawing edges.
@@ -81,6 +88,34 @@ class EngineBridge : public QObject, public synapse::Observer {
   Q_PROPERTY(double currentLoss READ currentLoss NOTIFY trainingProgress)
   Q_PROPERTY(QVariantList lossHistory READ lossHistory NOTIFY trainingProgress)
   Q_PROPERTY(bool trained READ trained NOTIFY trainingProgress)
+  // --- generalization: hold out part of the data and score it separately ----
+  Q_PROPERTY(double valFraction READ valFraction WRITE setValFraction NOTIFY validationChanged)
+  Q_PROPERTY(bool validationOn READ validationOn NOTIFY validationChanged)
+  Q_PROPERTY(double valLoss READ valLoss NOTIFY trainingProgress)
+  Q_PROPERTY(double trainAccuracy READ trainAccuracy NOTIFY trainingProgress)
+  Q_PROPERTY(double valAccuracy READ valAccuracy NOTIFY trainingProgress)
+  Q_PROPERTY(QVariantList valLossHistory READ valLossHistory NOTIFY trainingProgress)
+  Q_PROPERTY(int trainCount READ trainCount NOTIFY trainingProgress)
+  Q_PROPERTY(int valCount READ valCount NOTIFY trainingProgress)
+  // --- the coach: training that supervises itself ---------------------------
+  Q_PROPERTY(bool autoTraining READ autoTraining NOTIFY autoChanged)
+  Q_PROPERTY(QString autoStatus READ autoStatus NOTIFY autoChanged)
+  Q_PROPERTY(QVariantList autoLog READ autoLog NOTIFY autoChanged)
+  // Why training ended: "" | "converged" | "stalled" | "overfit" | "diverged". The UI turns
+  // this into concrete advice so a poor result never leaves you with nowhere to go.
+  Q_PROPERTY(QString autoOutcome READ autoOutcome NOTIFY autoChanged)
+  // --- the first-run journey: testing what it learned -----------------------
+  // After training, drawing a NEW input starts a little test: the app asks whether the
+  // answer was right, and the coach uses the tally to decide what to say next.
+  Q_PROPERTY(bool awaitingVerdict READ awaitingVerdict NOTIFY journeyChanged)
+  Q_PROPERTY(int testsPassed READ testsPassed NOTIFY journeyChanged)
+  Q_PROPERTY(int testsFailed READ testsFailed NOTIFY journeyChanged)
+  // Guidance you can switch off once you know your way around. Both persist between runs.
+  Q_PROPERTY(bool coachingEnabled READ coachingEnabled WRITE setCoachingEnabled NOTIFY guidanceChanged)
+  Q_PROPERTY(bool autoTrainEnabled READ autoTrainEnabled WRITE setAutoTrainEnabled NOTIFY guidanceChanged)
+  // --- optimizer: how a weight moves once backprop knows the direction ------
+  Q_PROPERTY(QString optimizer READ optimizer WRITE setOptimizer NOTIFY optimizerChanged)
+  Q_PROPERTY(QStringList optimizerNames READ optimizerNames NOTIFY optimizerNamesChanged)
   // gpuTraining: full-batch gradient descent on the GPU vs per-sample SGD on the CPU.
   Q_PROPERTY(bool gpuTraining READ gpuTraining WRITE setGpuTraining NOTIFY gpuTrainingChanged)
 
@@ -112,6 +147,8 @@ class EngineBridge : public QObject, public synapse::Observer {
   QStringList activationNames() const;
   QString buildOutput() const { return m_buildOutput; }
   bool building() const { return m_building; }
+  QString engineKind() const { return m_session ? m_session->kind() : QStringLiteral("none"); }
+  bool hasSavedWeights() const;
   QString inputLayout() const { return m_inputLayout; }
   int inputRows() const { return m_inputRows; }
   int inputCols() const { return m_inputCols; }
@@ -128,6 +165,29 @@ class EngineBridge : public QObject, public synapse::Observer {
   int epoch() const { return m_epoch; }
   double currentLoss() const { return m_currentLoss; }
   QVariantList lossHistory() const { return m_lossHistory; }
+  double valFraction() const { return m_valFraction; }
+  bool validationOn() const { return m_valFraction > 0.0; }
+  double valLoss() const { return static_cast<double>(m_metrics.val_loss); }
+  double trainAccuracy() const { return static_cast<double>(m_metrics.train_acc); }
+  double valAccuracy() const { return static_cast<double>(m_metrics.val_acc); }
+  QVariantList valLossHistory() const { return m_valLossHistory; }
+  int trainCount() const { return m_metrics.train_n; }
+  int valCount() const { return m_metrics.val_n; }
+  QString optimizer() const { return m_optimizer; }
+  bool autoTraining() const { return m_autoTraining; }
+  QString autoStatus() const { return m_autoStatus; }
+  QVariantList autoLog() const { return m_autoLog; }
+  QString autoOutcome() const { return m_autoOutcome; }
+  bool awaitingVerdict() const { return m_awaitingVerdict; }
+  int testsPassed() const { return m_testsPassed; }
+  int testsFailed() const { return m_testsFailed; }
+  bool coachingEnabled() const { return m_coachingEnabled; }
+  bool autoTrainEnabled() const { return m_autoTrainEnabled; }
+  void setCoachingEnabled(bool on);
+  void setAutoTrainEnabled(bool on);
+  QStringList optimizerNames() const;
+  void setValFraction(double f);
+  void setOptimizer(const QString& name);
   bool trained() const { return m_epoch > 0; }
   bool gpuTraining() const { return m_gpuTraining; }
   void setGpuTraining(bool on);
@@ -199,6 +259,23 @@ class EngineBridge : public QObject, public synapse::Observer {
   Q_INVOKABLE void saveCustomActivationSource(const QString& src);
   Q_INVOKABLE void rebuildEngine();
 
+  // --- trained weights: keep what you trained -------------------------------
+  // Weights live in a sidecar next to the blueprint (models/weights/<name>.json), so
+  // blueprints stay pure templates and a trained model is its own artifact.
+  // Train with supervision: it adjusts the learning rate, rewinds if it destabilizes,
+  // and stops early if it starts memorizing — narrating each decision.
+  Q_INVOKABLE void autoTrainStart();
+  Q_INVOKABLE void autoTrainStop();
+  // A one-click "give it more capacity" for when it stalls at a poor score: doubles the
+  // hidden layers (or adds one if there is none) and rebuilds.
+  Q_INVOKABLE void growNetwork();
+  // "Was that right?" — the answer drives the coach's next suggestion.
+  Q_INVOKABLE void recordTest(bool correct);
+  Q_INVOKABLE void resetJourney();
+
+  Q_INVOKABLE void saveWeights();
+  Q_INVOKABLE void loadWeights();
+
   // --- synapse::Observer ---------------------------------------------------
   void on_topology(const synapse::Topology& topo) override;
   void on_step(const synapse::StepSnapshot& snap) override;
@@ -219,6 +296,14 @@ class EngineBridge : public QObject, public synapse::Observer {
   void errorOccurred(const QString& message);
   void buildOutputChanged();
   void buildingChanged();
+  void activationNamesChanged();
+  void optimizerNamesChanged();
+  void optimizerChanged();
+  void validationChanged();
+  void weightsChanged();
+  void autoChanged();
+  void guidanceChanged();
+  void journeyChanged();
 
  private slots:
   void onTick();       // forward-playback timer: advance one layer
@@ -230,13 +315,18 @@ class EngineBridge : public QObject, public synapse::Observer {
   void setTraining(bool training);
   std::vector<float> toVector(const QVariantList& input) const;
   void scanBlueprints();      // discover the template files on disk
-  float run_one_epoch();      // shuffle + one CPU SGD pass over the dataset; returns avg loss
-  float run_one_epoch_gpu();  // one full-batch GPU gradient-descent step
-  void ensureFlatDataset();   // (re)build the flattened input/target arrays for the GPU path
   void refreshDisplay();      // re-run forward on the current input to update the graph
   void seedInitialLoss();     // record the pre-training loss as the curve's first point
+  void syncDataset();         // push the dataset to the engine (it owns the training loop)
+  void applyMetrics(const synapse::Metrics& m, bool record);
+  void noteInputTried();      // a hand-edited input after training counts as a test
+  QString weightsPath() const;   // sidecar file for the current blueprint
+  bool usingSubprocess() const;
+  void reloadEngineProcess(); // swap in a freshly-built engine process, GUI stays up
 
-  synapse::Network m_net;
+  // The engine — either linked in-process or running as its own process (see
+  // ModelSession). Everything below talks only to this interface.
+  std::unique_ptr<ModelSession> m_session;
   synapse::Topology m_topo;
   QString m_modelName;
   QString m_deviceName;
@@ -279,9 +369,24 @@ class EngineBridge : public QObject, public synapse::Observer {
   unsigned m_seed = 42;
 
   bool m_gpuTraining = false;
-  std::vector<float> m_flatIn;   // N*input_dim, cached for the GPU batched path
-  std::vector<float> m_flatOut;  // N*output_dim
-  bool m_flatDirty = true;
+  synapse::Metrics m_metrics;      // latest train/val loss + accuracy
+  double m_valFraction = 0.0;      // 0 = train on everything (default)
+  QVariantList m_valLossHistory;   // second curve on the loss chart
+  QString m_optimizer = "sgd";
+
+  // auto-training coach
+  AutoTrainer m_auto;
+  bool m_autoTraining = false;
+  QString m_autoStatus;
+  QVariantList m_autoLog;
+  QString m_autoOutcome;
+  bool m_awaitingVerdict = false;
+  int m_testsPassed = 0;
+  int m_testsFailed = 0;
+  bool m_coachingEnabled = true;
+  bool m_autoTrainEnabled = true;
+  std::vector<float> m_bestParams;   // best weights seen this run, for rewind/early-stop
+  void applyAutoAction();
 
   // Tier-2 "Code Lab": rebuild the engine from edited C++, then relaunch.
   QString m_buildOutput;

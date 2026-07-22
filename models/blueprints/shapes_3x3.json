@@ -737,6 +737,24 @@
                 1,
                 0
             ]
+        },
+        {
+            "input": [
+                0,
+                0,
+                1,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0
+            ],
+            "target": [
+                0,
+                1,
+                0
+            ]
         }
     ],
     "description": "Paint a line into a 3×3 grid → is it horizontal, vertical, or diagonal? A small warm-up for the 5×5 OCR grid.",
